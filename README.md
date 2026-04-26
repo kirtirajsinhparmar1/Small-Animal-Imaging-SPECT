@@ -7,7 +7,7 @@ This repository contains the local ALO SPECT pipeline, including scanner geometr
 Run the full pipeline with:
 
 ```bash
-python run_pipeline.py --run-name my_run
+python run_pipeline.py --run-name my_run --layout-idxs 0,1
 ```
 
 The orchestrator runs the stages in order:
@@ -40,4 +40,5 @@ logs/      per-stage command logs
 
 - PPDF generation is parallelized across poses.
 - The pipeline preserves the existing stage scripts and only coordinates them.
-- The phantom used for projection is copied into the run-local `recon/` directory when available.
+- Scientific/output-affecting defaults live in the individual stage scripts. The pipeline only forwards those values when explicitly provided.
+- If `--phantom` is provided, the phantom is copied into the run-local `recon/` directory; otherwise `projection_t8.py` uses its own default.
