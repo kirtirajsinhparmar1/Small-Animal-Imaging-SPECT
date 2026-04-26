@@ -155,9 +155,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("layout_idx", type=int, help="layout index (e.g., 0)")
     ap.add_argument("--t8", action="store_true",
-                    help="aggregate across 8 T8 pose files (_t8_00..07)")
+                    help="analyze one T8-aggregated masks/properties pair per layout")
     ap.add_argument("--pose", type=int, default=None,
-                    help="If set (0..7), analyze only that single T8 pose file")
+                    help="legacy per-pose T8 analysis is no longer supported")
     ap.add_argument("--n-bins", type=int, default=360)
     ap.add_argument("--fwhm-min", type=float, default=0.0)
     ap.add_argument("--fwhm-max", type=float, default=9.0)
@@ -182,32 +182,94 @@ def main():
     IMG_NX, IMG_NY = args.img_nx, args.img_ny
     n_pix = IMG_NX * IMG_NY
 
-    # Decide which “system matrices” to aggregate
-    if not args.t8:
-        pose_tags = [None]   # base only (single file)
+    if args.pose is not None:
+        raise ValueError("--pose is incompatible with T8 aggregate baseline mode")
+
+    if args.t8:
+        file_specs = [
+            (
+                "t8_aggregate",
+                os.path.join(input_dir, f"beams_properties_configuration_{layout_idx:03d}.hdf5"),
+                os.path.join(input_dir, f"beams_masks_configuration_{layout_idx:03d}.hdf5"),
+            )
+        ]
     else:
-        if args.pose is not None:
-            if not (0 <= args.pose <= 7):
-                raise ValueError("--pose must be 0..7")
-            pose_tags = [args.pose]
-        else:
-            pose_tags = list(range(8))  # T8 poses
+        file_specs = [
+            (
+                "base",
+                os.path.join(input_dir, f"beams_properties_configuration_{layout_idx:02d}.hdf5"),
+                os.path.join(input_dir, f"beams_masks_configuration_{layout_idx:02d}.hdf5"),
+            )
+        ]
+
+    if args.t8:
+        pose_label, props_file, masks_file = file_specs[0]
+        if not os.path.exists(props_file) or not os.path.exists(masks_file):
+            print("\n[ERROR] Missing T8 aggregate inputs.")
+            print(f"        props: {props_file} exists={os.path.exists(props_file)}")
+            print(f"        masks: {masks_file} exists={os.path.exists(masks_file)}")
+            sys.exit(1)
+
+        print(f"\n--- Processing {pose_label} ---")
+        print(f"  props: {props_file}")
+        print(f"  masks: {masks_file}")
+
+        layout_beams_properties, _ = load_beam_properties(props_file)
+        beams_masks = load_beam_masks(masks_file)
+
+        digitized_angles = torch.bucketize(
+            layout_beams_properties[:, 3], angular_bin_boundaries, right=False
+        )
+        layout_beams_properties = torch.cat(
+            (layout_beams_properties, (digitized_angles - 1).unsqueeze(1).float()),
+            dim=1,
+        )
+
+        layout_beams_properties_filtered = layout_beams_properties[
+            torch.isnan(layout_beams_properties[:, 3]) == False
+        ]
+
+        if layout_beams_properties_filtered[:, 7].numel() > 0:
+            beams_sensitivity_max = layout_beams_properties_filtered[:, 7].max()
+            layout_beams_properties_filtered = layout_beams_properties_filtered[
+                layout_beams_properties_filtered[:, 7] > beams_sensitivity_max * 0.01
+            ]
+
+        asci_histogram_total = torch.zeros((n_pix, n_bins), dtype=torch.int32)
+        for beam_props in layout_beams_properties_filtered:
+            detector_idx = int(beam_props[1])
+            beam_idx = int(beam_props[2])
+            angle_bin_idx = int(beam_props[-1])
+            if 0 <= angle_bin_idx < n_bins:
+                asci_histogram_total[beams_masks[detector_idx] == beam_idx, angle_bin_idx] += 1
+
+        out_name = f"asci_histogram_{layout_idx:03d}.hdf5"
+        if args.out_suffix:
+            out_name = out_name.replace(".hdf5", f"_{args.out_suffix}.hdf5")
+
+        out_path = os.path.join(input_dir, out_name)
+        print(f"\nSaving combined histogram to: {out_path}")
+        with h5py.File(out_path, "w") as f:
+            f.create_dataset("asci_histogram", data=asci_histogram_total.numpy())
+            f.attrs["layout_idx"] = int(layout_idx)
+            f.attrs["t8_aggregated"] = int(args.t8)
+            f.attrs["n_bins"] = int(n_bins)
+            f.attrs["img_nx"] = int(IMG_NX)
+            f.attrs["img_ny"] = int(IMG_NY)
+            f.attrs["total_valid_beams_used"] = int(layout_beams_properties_filtered.shape[0])
+
+        filled = int((asci_histogram_total > 0).sum().item())
+        total = int(n_pix * n_bins)
+        print(f"[DONE] ASCI: {filled}/{total} bins filled = {filled / max(total, 1) * 100:.2f}%")
+        print("[DONE] Finished.")
+        return
 
     asci_histogram_total = torch.zeros((n_pix, n_bins), dtype=torch.int32)
 
     total_valid_beams_used = 0
     total_missing_pairs = 0
 
-    for pose in pose_tags:
-        if pose is None:
-            props_file = os.path.join(input_dir, f"beams_properties_configuration_{layout_idx:02d}.hdf5")
-            masks_file = os.path.join(input_dir, f"beams_masks_configuration_{layout_idx:02d}.hdf5")
-            pose_label = "base"
-        else:
-            props_file = os.path.join(input_dir, f"beams_properties_configuration_{layout_idx:02d}_t8_{pose:02d}.hdf5")
-            masks_file = os.path.join(input_dir, f"beams_masks_configuration_{layout_idx:02d}_t8_{pose:02d}.hdf5")
-            pose_label = f"t8_{pose:02d}"
-
+    for pose_label, props_file, masks_file in file_specs:
         if not os.path.exists(props_file) or not os.path.exists(masks_file):
             print(f"[WARN] Missing files for {pose_label}.")
             print(f"       props: {props_file} exists={os.path.exists(props_file)}")
@@ -297,13 +359,13 @@ def main():
         total_valid_beams_used += int(props_f.shape[0])
         print(f"  Added {pose_label} histogram into total.")
 
-    if total_missing_pairs == len(pose_tags):
+    if total_missing_pairs == len(file_specs):
         print("\n[ERROR] No valid (properties, masks) pairs were found. Nothing to save.")
         sys.exit(1)
 
     # ---- Save output ----
     if args.t8:
-        out_name = f"asci_histogram_{layout_idx:02d}_t8_agg.hdf5"
+        out_name = f"asci_histogram_{layout_idx:03d}.hdf5"
     else:
         out_name = f"asci_histogram_{layout_idx:02d}.hdf5"
 
