@@ -1,0 +1,7 @@
+{
+  "dependencies": {
+    "@openai/codex": "^0.125.0",
+    "context-mode": "^1.0.94",
+    "oh-my-codex": "^0.15.0"
+  }
+}

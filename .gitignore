@@ -1,0 +1,9 @@
+.codex/
+.omx/
+.codexignore
+AGENTS.md
+__pycache__/
+*.pyc
+node_modules/
+runs/
+*.log
