@@ -215,7 +215,7 @@ import os
 import argparse
 import h5py
 from typing import Optional
-from torch import cat, tensor, arange
+from torch import cat, tensor, arange, float32
 
 from beam_property_extract import (
     beams_boundaries_radians,
@@ -245,6 +245,7 @@ DEFAULT_DATA_DIR = os.path.join(_HERE, "data")
 DEFAULT_LAYOUT_TENSOR = (
     "scanner_layouts_24a4365260a3f68491dfa8ca55e0ecc2_rot2_ang1p0deg_trans1x1_step0p0x0p0.tensor"
 )
+N_T8_POSES = 8
 
 def _pick_default_layout_file(data_dir: str) -> Optional[str]:
     try:
@@ -265,6 +266,30 @@ def read_pose_center_from_ppdf_h5(ppdf_path: str):
     return dx, dy, pose_tag, pose_idx
 
 
+def load_aggregated_t8_ppdfs(data_dir: str, layout_idx: int):
+    """Load and sum the 8 T8 PPDF pose files for one layout."""
+    aggregated = None
+    loaded = 0
+    for pose_idx in range(N_T8_POSES):
+        ppdf_filename = f"position_{layout_idx:03d}_ppdfs_t8_{pose_idx:02d}.hdf5"
+        ppdf_path = os.path.join(data_dir, ppdf_filename)
+        if not os.path.exists(ppdf_path):
+            print(f"[WARN] Missing T8 PPDF pose file: {ppdf_path}")
+            continue
+        with h5py.File(ppdf_path, "r") as f:
+            ppdfs = tensor(f["ppdfs"][:], dtype=float32)
+        if aggregated is None:
+            aggregated = ppdfs
+        else:
+            aggregated += ppdfs
+        loaded += 1
+
+    if aggregated is None:
+        raise FileNotFoundError(f"No T8 PPDF files found for layout {layout_idx:03d} in {data_dir}")
+    print(f"[INFO] Aggregated {loaded}/{N_T8_POSES} T8 PPDF pose files for layout {layout_idx:03d}")
+    return aggregated
+
+
 def run_one(
     layout_idx: int,
     ppdf_filename: str,
@@ -273,6 +298,7 @@ def run_one(
     data_dir: str,
     layout_file: str,
     fov_center_xy,
+    ppdfs_override=None,
 ):
     print(f"\n--- Beam property extraction (T8) ---")
     print(f"[INFO] layout_idx       : {layout_idx}")
@@ -310,9 +336,12 @@ def run_one(
         int(layout_idx), scanner_layouts_data
     )
 
-    ppdfs = load_ppdfs_data_from_hdf5(
-        ppdfs_dataset_dir, ppdf_filename, fov_dict
-    )
+    if ppdfs_override is None:
+        ppdfs = load_ppdfs_data_from_hdf5(
+            ppdfs_dataset_dir, ppdf_filename, fov_dict
+        )
+    else:
+        ppdfs = ppdfs_override
 
     # --- Precompute things that do NOT change per-detector ---
     detector_unit_centers = detector_units_vertices.mean(dim=1)
@@ -332,7 +361,7 @@ def run_one(
     )
     hull_points_batch = sort_points_for_hull_batch_2d(hull_points_batch)
 
-    # pixel xy coordinates are fixed for this fov_dict (depends on center!)
+    # Pixel xy coordinates are fixed for this fov_dict.
     fov_points_xy = pixels_coordinates(fov_dict)
 
     n_detector_units = int(detector_units_vertices.shape[0])
@@ -421,8 +450,8 @@ def main():
         default=None,
         help="path to scanner_layouts_*.tensor (default: newest ./data/scanner_layouts_*.tensor, else DEFAULT_LAYOUT_TENSOR)",
     )
-    ap.add_argument("--t8", action="store_true", help="use T8 PPDF files (position_XXX_ppdfs_t8_YY.hdf5)")
-    ap.add_argument("--pose", type=int, default=None, help="T8 pose index (0..7). If omitted, runs all 8 poses.")
+    ap.add_argument("--t8", action="store_true", help="sum T8 PPDF pose files and extract one properties file per layout")
+    ap.add_argument("--pose", type=int, default=None, help="legacy per-pose T8 mode is no longer supported")
     args = ap.parse_args()
 
     layout_idx = args.layout_idx
@@ -444,43 +473,20 @@ def main():
         )
         return
 
-    # T8 behavior
-    ppdf_dir = data_dir
-
     if args.pose is not None:
-        if not (0 <= args.pose <= 7):
-            raise ValueError("--pose must be 0..7 for T8")
+        raise ValueError("--pose is incompatible with T8 aggregate baseline mode")
 
-        ppdf_filename = f"position_{layout_idx:03d}_ppdfs_t8_{args.pose:02d}.hdf5"
-        ppdf_path = os.path.join(ppdf_dir, ppdf_filename)
-        dx, dy, pose_tag, pose_idx = read_pose_center_from_ppdf_h5(ppdf_path)
-
-        out_hdf5_filename = f"beams_properties_configuration_{layout_idx:02d}_t8_{args.pose:02d}.hdf5"
-        run_one(
-            layout_idx,
-            ppdf_filename,
-            out_hdf5_filename,
-            data_dir=data_dir,
-            layout_file=layout_file,
-            fov_center_xy=(dx, dy),
-        )
-
-    else:
-        # run all 8 poses
-        for pose_idx in range(8):
-            ppdf_filename = f"position_{layout_idx:03d}_ppdfs_t8_{pose_idx:02d}.hdf5"
-            ppdf_path = os.path.join(ppdf_dir, ppdf_filename)
-            dx, dy, pose_tag, _ = read_pose_center_from_ppdf_h5(ppdf_path)
-
-            out_hdf5_filename = f"beams_properties_configuration_{layout_idx:02d}_t8_{pose_idx:02d}.hdf5"
-            run_one(
-                layout_idx,
-                ppdf_filename,
-                out_hdf5_filename,
-                data_dir=data_dir,
-                layout_file=layout_file,
-                fov_center_xy=(dx, dy),
-            )
+    aggregated_ppdfs = load_aggregated_t8_ppdfs(data_dir, layout_idx)
+    out_hdf5_filename = f"beams_properties_configuration_{layout_idx:03d}.hdf5"
+    run_one(
+        layout_idx,
+        f"position_{layout_idx:03d}_ppdfs_t8_00..07.hdf5 (summed)",
+        out_hdf5_filename,
+        data_dir=data_dir,
+        layout_file=layout_file,
+        fov_center_xy=(0.0, 0.0),
+        ppdfs_override=aggregated_ppdfs,
+    )
 
 
 if __name__ == "__main__":

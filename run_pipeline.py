@@ -204,21 +204,19 @@ class Pipeline:
 
     def generated_mask_files(self) -> list[Path]:
         return [
-            self.data_dir / f"beams_masks_configuration_{layout_idx:02d}_t8_{pose_idx:02d}.hdf5"
+            self.data_dir / f"beams_masks_configuration_{layout_idx:03d}.hdf5"
             for layout_idx in self.args.layout_idxs
-            for pose_idx in self.pose_indices_for_layout(layout_idx)
         ]
 
     def generated_property_files(self) -> list[Path]:
         return [
-            self.data_dir / f"beams_properties_configuration_{layout_idx:02d}_t8_{pose_idx:02d}.hdf5"
+            self.data_dir / f"beams_properties_configuration_{layout_idx:03d}.hdf5"
             for layout_idx in self.args.layout_idxs
-            for pose_idx in self.pose_indices_for_layout(layout_idx)
         ]
 
     def generated_asci_files(self) -> list[Path]:
         return [
-            self.data_dir / f"asci_histogram_{layout_idx:02d}_t8_agg.hdf5"
+            self.data_dir / f"asci_histogram_{layout_idx:03d}.hdf5"
             for layout_idx in self.args.layout_idxs
         ]
 
@@ -309,99 +307,61 @@ class Pipeline:
 
     def stage_masks(self) -> None:
         for layout_idx in self.args.layout_idxs:
-            pose_indices = self.pose_indices_for_layout(layout_idx)
-            if self.args.dry_run and not pose_indices:
-                cmd = self.command_with_pairs(
-                    "arg_extract_beam_masks.py",
-                    [
-                        layout_idx,
-                        "--data-dir",
-                        self.data_dir,
-                        "--layout-file",
-                        self.layout_file,
-                        "--t8",
-                    ],
-                )
-                self.run_cmd(f"beam masks layout {layout_idx:02d}", cmd)
-                continue
-            for pose_idx in pose_indices:
-                out_path = self.data_dir / f"beams_masks_configuration_{layout_idx:02d}_t8_{pose_idx:02d}.hdf5"
-                if not self.args.dry_run and out_path.exists():
-                    if self.args.resume:
-                        print(f"Skipping beam masks layout {layout_idx:02d} pose {pose_idx:02d}; output exists")
-                        continue
-                    raise FileExistsError(f"Beam mask output already exists: {out_path}")
-                cmd = self.command_with_pairs(
-                    "arg_extract_beam_masks.py",
-                    [
-                        layout_idx,
-                        "--data-dir",
-                        self.data_dir,
-                        "--layout-file",
-                        self.layout_file,
-                        "--t8",
-                        "--pose",
-                        pose_idx,
-                    ],
-                )
-                self.run_cmd(f"beam masks layout {layout_idx:02d} pose {pose_idx:02d}", cmd)
+            out_path = self.data_dir / f"beams_masks_configuration_{layout_idx:03d}.hdf5"
+            if not self.args.dry_run and out_path.exists():
+                if self.args.resume:
+                    print(f"Skipping beam masks layout {layout_idx:03d}; output exists")
+                    continue
+                raise FileExistsError(f"Beam mask output already exists: {out_path}")
+            cmd = self.command_with_pairs(
+                "arg_extract_beam_masks.py",
+                [
+                    layout_idx,
+                    "--data-dir",
+                    self.data_dir,
+                    "--layout-file",
+                    self.layout_file,
+                    "--t8",
+                ],
+            )
+            self.run_cmd(f"beam masks layout {layout_idx:03d}", cmd)
         self.expect_all_exist(self.generated_mask_files(), "beam mask")
 
     def stage_properties(self) -> None:
         for layout_idx in self.args.layout_idxs:
-            pose_indices = self.pose_indices_for_layout(layout_idx)
-            if self.args.dry_run and not pose_indices:
-                cmd = self.command_with_pairs(
-                    "arg_extract_beam_properties.py",
-                    [
-                        layout_idx,
-                        "--data-dir",
-                        self.data_dir,
-                        "--layout-file",
-                        self.layout_file,
-                        "--t8",
-                    ],
-                )
-                self.run_cmd(f"beam properties layout {layout_idx:02d}", cmd)
-                continue
-            for pose_idx in pose_indices:
-                out_path = self.data_dir / (
-                    f"beams_properties_configuration_{layout_idx:02d}_t8_{pose_idx:02d}.hdf5"
-                )
-                if not self.args.dry_run and out_path.exists():
-                    if self.args.resume:
-                        print(f"Skipping beam properties layout {layout_idx:02d} pose {pose_idx:02d}; output exists")
-                        continue
-                    raise FileExistsError(f"Beam property output already exists: {out_path}")
-                cmd = self.command_with_pairs(
-                    "arg_extract_beam_properties.py",
-                    [
-                        layout_idx,
-                        "--data-dir",
-                        self.data_dir,
-                        "--layout-file",
-                        self.layout_file,
-                        "--t8",
-                        "--pose",
-                        pose_idx,
-                    ],
-                )
-                self.run_cmd(f"beam properties layout {layout_idx:02d} pose {pose_idx:02d}", cmd)
+            out_path = self.data_dir / f"beams_properties_configuration_{layout_idx:03d}.hdf5"
+            if not self.args.dry_run and out_path.exists():
+                if self.args.resume:
+                    print(f"Skipping beam properties layout {layout_idx:03d}; output exists")
+                    continue
+                raise FileExistsError(f"Beam property output already exists: {out_path}")
+            cmd = self.command_with_pairs(
+                "arg_extract_beam_properties.py",
+                [
+                    layout_idx,
+                    "--data-dir",
+                    self.data_dir,
+                    "--layout-file",
+                    self.layout_file,
+                    "--t8",
+                ],
+            )
+            self.run_cmd(f"beam properties layout {layout_idx:03d}", cmd)
         self.expect_all_exist(self.generated_property_files(), "beam property")
 
     def stage_asci(self) -> None:
         for layout_idx in self.args.layout_idxs:
-            out_path = self.data_dir / f"asci_histogram_{layout_idx:02d}_t8_agg.hdf5"
+            out_path = self.data_dir / f"asci_histogram_{layout_idx:03d}.hdf5"
             if not self.args.dry_run and out_path.exists():
                 if self.args.resume:
-                    print(f"Skipping ASCI analysis layout {layout_idx:02d}; output exists")
+                    print(f"Skipping ASCI analysis layout {layout_idx:03d}; output exists")
                     continue
                 raise FileExistsError(f"ASCI output already exists: {out_path}")
             cmd = self.command_with_pairs(
                 "arg_analyze_extracted_properties.py",
                 self.asci_args(layout_idx),
             )
-            self.run_cmd(f"ASCI aggregate layout {layout_idx:02d}", cmd)
+            self.run_cmd(f"ASCI aggregate layout {layout_idx:03d}", cmd)
         self.expect_all_exist(self.generated_asci_files(), "ASCI aggregate")
 
     def asci_args(self, layout_idx: int) -> list[object]:
