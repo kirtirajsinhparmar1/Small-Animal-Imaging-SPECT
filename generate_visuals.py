@@ -223,14 +223,21 @@ def save_asci_visuals(data_dir: str, plot_dir: str, layout_idxs: Sequence[int], 
     asci_sum = None
     loaded = 0
     for idx in layout_idxs:
-        for asci_path in sorted(glob.glob(os.path.join(data_dir, f"asci_histogram_{idx:02d}_t8_agg.hdf5"))):
-            with h5py.File(asci_path, "r") as f:
-                hist = f["asci_histogram"][:].astype(np.int64, copy=False)
-            if asci_sum is None:
-                asci_sum = hist
-            else:
-                asci_sum += hist
-            loaded += 1
+        candidates = [
+            os.path.join(data_dir, f"asci_histogram_{idx:03d}.hdf5"),
+            os.path.join(data_dir, f"asci_histogram_{idx:02d}_t8_agg.hdf5"),
+            os.path.join(data_dir, f"asci_histogram_{idx:02d}.hdf5"),
+        ]
+        asci_path = next((path for path in candidates if os.path.exists(path)), None)
+        if asci_path is None:
+            continue
+        with h5py.File(asci_path, "r") as f:
+            hist = f["asci_histogram"][:].astype(np.int64, copy=False)
+        if asci_sum is None:
+            asci_sum = hist
+        else:
+            asci_sum += hist
+        loaded += 1
 
     if asci_sum is None:
         return out_paths
@@ -261,8 +268,14 @@ def save_asci_visuals(data_dir: str, plot_dir: str, layout_idxs: Sequence[int], 
 def save_beam_multiplexing_visuals(data_dir: str, plot_dir: str, layout_idxs: Sequence[int]) -> list[str]:
     out_paths: list[str] = []
     for idx in layout_idxs:
-        prop_paths = sorted(glob.glob(os.path.join(data_dir, f"beams_properties_configuration_{idx:02d}_t8_*.hdf5")))
-        mask_paths = sorted(glob.glob(os.path.join(data_dir, f"beams_masks_configuration_{idx:02d}_t8_*.hdf5")))
+        aggregate_prop = os.path.join(data_dir, f"beams_properties_configuration_{idx:03d}.hdf5")
+        aggregate_mask = os.path.join(data_dir, f"beams_masks_configuration_{idx:03d}.hdf5")
+        if os.path.exists(aggregate_prop) and os.path.exists(aggregate_mask):
+            prop_paths = [aggregate_prop]
+            mask_paths = [aggregate_mask]
+        else:
+            prop_paths = sorted(glob.glob(os.path.join(data_dir, f"beams_properties_configuration_{idx:02d}_t8_*.hdf5")))
+            mask_paths = sorted(glob.glob(os.path.join(data_dir, f"beams_masks_configuration_{idx:02d}_t8_*.hdf5")))
         if not prop_paths or not mask_paths:
             continue
 
@@ -323,7 +336,8 @@ def save_beam_multiplexing_visuals(data_dir: str, plot_dir: str, layout_idxs: Se
 
 
 def save_cumulative_beam_widths(data_dir: str, plot_dir: str) -> str | None:
-    prop_paths = sorted(glob.glob(os.path.join(data_dir, "beams_properties_configuration_*.hdf5")))
+    aggregate_prop_paths = sorted(glob.glob(os.path.join(data_dir, "beams_properties_configuration_[0-9][0-9][0-9].hdf5")))
+    prop_paths = aggregate_prop_paths or sorted(glob.glob(os.path.join(data_dir, "beams_properties_configuration_*.hdf5")))
     all_fwhm = []
     for props_path in prop_paths:
         with h5py.File(props_path, "r") as f:

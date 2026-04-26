@@ -39,6 +39,7 @@ logs/      per-stage command logs
 ## Notes
 
 - PPDF generation is parallelized across poses.
+- T8 beam masks, beam properties, and ASCI are computed once per layout from the in-memory sum of the eight T8 PPDF pose files. This matches the Omer baseline contract and produces `beams_masks_configuration_000.hdf5`, `beams_properties_configuration_000.hdf5`, and `asci_histogram_000.hdf5` style outputs.
 - The pipeline preserves the existing stage scripts and only coordinates them.
 - Scientific/output-affecting defaults live in the individual stage scripts. The pipeline only forwards those values when explicitly provided.
 - If `--phantom` is provided, the phantom is copied into the run-local `recon/` directory; otherwise `projection_t8.py` uses its own default.

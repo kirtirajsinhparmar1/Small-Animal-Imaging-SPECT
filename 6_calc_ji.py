@@ -6,8 +6,8 @@ JI = (sensitivity_mean / FWHM^2) * ASCI_pct / 100
 
 Local file conventions:
   - position_{layout:03d}_ppdfs_t8_{pose:02d}.hdf5
-  - beams_properties_configuration_{layout:02d}_t8_{pose:02d}.hdf5
-  - asci_histogram_{layout:02d}_t8_agg.hdf5
+  - beams_properties_configuration_{layout:03d}.hdf5
+  - asci_histogram_{layout:03d}.hdf5
 
 This script aggregates all matching files in a work directory and writes one
 CSV row with the summary metrics.
@@ -103,12 +103,17 @@ def compute_fwhm_and_asci(
     Returns:
       (fwhm_mean, asci_pct, n_prop_files, n_asci_files)
     """
-    prop_files = sorted(
-        glob.glob(prop_pattern or os.path.join(work_dir, "beams_properties_configuration_*.hdf5"))
-    )
-    asci_files = sorted(
-        glob.glob(asci_pattern or os.path.join(work_dir, "asci_histogram_*.hdf5"))
-    )
+    if prop_pattern:
+        prop_files = sorted(glob.glob(prop_pattern))
+    else:
+        aggregate_prop_files = sorted(glob.glob(os.path.join(work_dir, "beams_properties_configuration_[0-9][0-9][0-9].hdf5")))
+        prop_files = aggregate_prop_files or sorted(glob.glob(os.path.join(work_dir, "beams_properties_configuration_*.hdf5")))
+
+    if asci_pattern:
+        asci_files = sorted(glob.glob(asci_pattern))
+    else:
+        aggregate_asci_files = sorted(glob.glob(os.path.join(work_dir, "asci_histogram_[0-9][0-9][0-9].hdf5")))
+        asci_files = aggregate_asci_files or sorted(glob.glob(os.path.join(work_dir, "asci_histogram_*.hdf5")))
 
     all_fwhm_values: list[float] = []
     combined_asci_hist = None
