@@ -1,5 +1,5 @@
-.codex/
 .omx/
+.codex/
 .codexignore
 AGENTS.md
 __pycache__/
@@ -7,3 +7,6 @@ __pycache__/
 node_modules/
 runs/
 *.log
+
+# Local chat/context artifacts (generated for LLM prompting/debugging).
+context_for_chat.*

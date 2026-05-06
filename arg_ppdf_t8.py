@@ -6,30 +6,38 @@ python arg_ppdf_t8.py 1 --layout_file ./data/scanner_layouts_*.tensor --a_mm 0.8
 import os
 import time
 import argparse
-import h5py
 import numpy as np
 import concurrent.futures
 import multiprocessing as mp
 from typing import Optional
-from torch import device, arange, tensor, get_num_threads
-
-from scanner_modeling._raytracer_2d._local_functions import (
-    ppdf_2d_local,
-    reduced_edges_2d_local,
-    sfov_properties,
-    subdivision_grid_rectangle,
-)
-from scanner_modeling.geometry_2d import (
-    fov_tensor_dict,
-    load_scanner_geometry_from_layout,
-    load_scanner_layouts,
-)
 
 def ellipse_offsets_t8(a_mm: float = 0.2, b_mm: float = 0.2, phase_deg: float = 0.0):
     """8 bed positions on an ellipse (a,b) in mm."""
     phase = np.deg2rad(phase_deg)
     thetas = np.linspace(0, 2*np.pi, 8, endpoint=False) + phase
     return [(float(a_mm*np.cos(t)), float(b_mm*np.sin(t))) for t in thetas]
+
+
+def parse_pose_idxs(value: str) -> list[int]:
+    poses = []
+    seen = set()
+    for part in value.split(","):
+        item = part.strip()
+        if not item:
+            continue
+        try:
+            pose = int(item)
+        except ValueError as exc:
+            raise ValueError(f"Invalid pose index: {item}") from exc
+        if pose < 0 or pose > 7:
+            raise ValueError(f"pose index must be in [0, 7], got {pose}")
+        if pose in seen:
+            raise ValueError(f"Duplicate pose index: {pose}")
+        poses.append(pose)
+        seen.add(pose)
+    if not poses:
+        raise ValueError("At least one pose index is required")
+    return poses
 
 def _set_torch_threads(torch_threads: Optional[int], interop_threads: Optional[int]):
     # Torch may not be installed in every environment running static checks; import inside.
@@ -60,6 +68,7 @@ def _compute_pose_worker(
     skip_existing: bool,
 ):
     _set_torch_threads(torch_threads, torch_interop_threads)
+    from scanner_modeling.geometry_2d import load_scanner_layouts
 
     out_name = f"position_{layout_idx:03d}_ppdfs_t8_{pose_idx:02d}.hdf5"
     out_path = os.path.join(output_dir, out_name)
@@ -90,7 +99,21 @@ def compute_pose(
     layouts_md5: str,
     output_dir: str,
 ):
+    from torch import arange, device, get_num_threads, tensor
+    from scanner_modeling._raytracer_2d._local_functions import (
+        ppdf_2d_local,
+        reduced_edges_2d_local,
+        sfov_properties,
+        subdivision_grid_rectangle,
+    )
+    from scanner_modeling.geometry_2d import (
+        fov_tensor_dict,
+        load_scanner_geometry_from_layout,
+    )
+
     default_device = device("cpu")
+    import h5py
+
     print(f"[T8 {pose_idx:02d}] dx={dx:.3f} mm dy={dy:.3f} mm")
 
     # materials for raytracing (keep consistent with your pipeline)
@@ -196,8 +219,10 @@ def main():
     ap.add_argument("--phase_deg", type=float, default=0.0, help="phase rotate the 8 positions (deg)")
     ap.add_argument("--pose_idx", type=int, default=None,
                     help="run only this single pose index (0-7). If omitted, run all 8.")
+    ap.add_argument("--pose-idxs", dest="pose_idxs", type=str, default=None,
+                    help="comma-separated pose indices to run, e.g. 0,2,4,6")
     ap.add_argument("--pose-workers", type=int, default=1,
-                    help="when running all 8 poses, number of parallel worker processes (default: 1)")
+                    help="when running multiple poses, number of parallel worker processes (default: 1)")
     ap.add_argument("--torch-threads", type=int, default=None,
                     help="torch.set_num_threads() inside each worker (default: auto)")
     ap.add_argument("--torch-interop-threads", type=int, default=None,
@@ -205,6 +230,8 @@ def main():
     ap.add_argument("--skip-existing", action="store_true",
                     help="if set, skip poses whose output HDF5 already exists")
     args = ap.parse_args()
+
+    from scanner_modeling.geometry_2d import load_scanner_layouts
 
     layout_dir = os.path.dirname(args.layout_file)
     layout_fname = os.path.basename(args.layout_file)
@@ -215,34 +242,57 @@ def main():
 
     poses = ellipse_offsets_t8(args.a_mm, args.b_mm, args.phase_deg)
 
+    if args.pose_idx is not None and args.pose_idxs is not None:
+        raise ValueError("Use either --pose_idx or --pose-idxs, not both")
+
     if args.pose_idx is not None:
-        # Single pose mode
         if not (0 <= args.pose_idx < len(poses)):
             raise ValueError(f"pose_idx={args.pose_idx} out of range 0..{len(poses)-1}")
-        print(f"--- T8 PPDF | layout={args.layout_idx} | pose={args.pose_idx} | a={args.a_mm} b={args.b_mm} ---")
-        dx, dy = poses[args.pose_idx]
-        out_name = f"position_{args.layout_idx:03d}_ppdfs_t8_{args.pose_idx:02d}.hdf5"
+        selected_pose_indices = [args.pose_idx]
+    elif args.pose_idxs is not None:
+        selected_pose_indices = parse_pose_idxs(args.pose_idxs)
+    else:
+        selected_pose_indices = list(range(len(poses)))
+
+    selected_pose_label = ",".join(str(pose_idx) for pose_idx in selected_pose_indices)
+
+    if len(selected_pose_indices) == 1:
+        pose_idx = selected_pose_indices[0]
+        print(
+            f"--- T8 PPDF | layout={args.layout_idx} | pose={pose_idx} | "
+            f"selected poses={selected_pose_label} | a={args.a_mm} b={args.b_mm} ---"
+        )
+        dx, dy = poses[pose_idx]
+        out_name = f"position_{args.layout_idx:03d}_ppdfs_t8_{pose_idx:02d}.hdf5"
         out_path = os.path.join(os.path.abspath(args.output_dir), out_name)
         if args.skip_existing and os.path.exists(out_path):
             print(f"[skip] exists: {out_path}")
             return
         compute_pose(
             layout_idx=args.layout_idx,
-            pose_idx=args.pose_idx,
+            pose_idx=pose_idx,
             dx=dx, dy=dy,
             scanner_layouts=scanner_layouts,
             layouts_md5=layouts_md5,
             output_dir=args.output_dir,
         )
     else:
-        # All 8 poses
-        print(f"--- T8 PPDFs | layout={args.layout_idx} | a={args.a_mm} b={args.b_mm} | poses=8 ---")
+        selected_jobs = [(pose_idx, poses[pose_idx]) for pose_idx in selected_pose_indices]
+        print(
+            f"--- T8 PPDFs | layout={args.layout_idx} | selected poses={selected_pose_label} | "
+            f"a={args.a_mm} b={args.b_mm} ---"
+        )
         pose_workers = int(args.pose_workers or 1)
         if pose_workers <= 1:
-            for i, (dx, dy) in enumerate(poses):
+            for pose_idx, (dx, dy) in selected_jobs:
+                out_name = f"position_{args.layout_idx:03d}_ppdfs_t8_{pose_idx:02d}.hdf5"
+                out_path = os.path.join(os.path.abspath(args.output_dir), out_name)
+                if args.skip_existing and os.path.exists(out_path):
+                    print(f"[skip] exists: {out_path}")
+                    continue
                 compute_pose(
                     layout_idx=args.layout_idx,
-                    pose_idx=i,
+                    pose_idx=pose_idx,
                     dx=dx, dy=dy,
                     scanner_layouts=scanner_layouts,
                     layouts_md5=layouts_md5,
@@ -251,18 +301,22 @@ def main():
         else:
             # Use separate worker processes per pose; each worker reloads the layout tensor.
             # This avoids pickling large torch tensors and keeps outputs disjoint (one HDF5 per pose).
-            max_workers = min(pose_workers, len(poses))
-            print(f"[parallel] pose_workers={max_workers} | torch_threads={args.torch_threads} | torch_interop_threads={args.torch_interop_threads}")
+            max_workers = min(pose_workers, len(selected_jobs))
+            print(
+                f"[parallel] pose_workers={max_workers} | "
+                f"torch_threads={args.torch_threads} | "
+                f"torch_interop_threads={args.torch_interop_threads}"
+            )
 
             ctx = mp.get_context("spawn")
             futures = []
             with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as ex:
-                for i, (dx, dy) in enumerate(poses):
+                for pose_idx, (dx, dy) in selected_jobs:
                     futures.append(
                         ex.submit(
                             _compute_pose_worker,
                             layout_idx=args.layout_idx,
-                            pose_idx=i,
+                            pose_idx=pose_idx,
                             dx=dx,
                             dy=dy,
                             layout_file=os.path.abspath(args.layout_file),

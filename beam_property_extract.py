@@ -661,12 +661,13 @@ def beams_properties_2d(
     ]
     beam_n_pixels = beams_masks.sum(dim=0)
 
+    beams_masks_by_beam = beams_masks.swapaxes(0, 1)
+
     # Get the weighted center of the beams
-    beams_weighted_centers = beams_weighted_center(
-        beams_masks,
+    beams_weighted_centers = get_beams_weighted_center(
+        beams_masks_by_beam,
         pixels_coordinates,
         relative_ppdf,
-        beams_relative_sensitivities,
     )
     beams_sensitivities = beams_relative_sensitivities * ppdf_2d.max()
 
@@ -684,7 +685,7 @@ def beams_properties_2d(
     )
 
     # Swap the axes of the beam masks
-    beams_masks = beams_masks.swapaxes(0, 1)
+    beams_masks = beams_masks_by_beam
     # Number of beams
     n_beams = beams_masks.shape[0]
 

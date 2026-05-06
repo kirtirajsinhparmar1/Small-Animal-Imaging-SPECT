@@ -30,6 +30,19 @@ DEFAULT_N_BINS = 360
 EPS = 1e-12
 
 
+def glob_pattern_list(pattern_text: str | None) -> list[str]:
+    """Resolve one glob or a comma-separated list of globs/exact paths."""
+    if not pattern_text:
+        return []
+    matches: list[str] = []
+    for pattern in pattern_text.split(","):
+        item = pattern.strip()
+        if not item:
+            continue
+        matches.extend(glob.glob(item))
+    return sorted(dict.fromkeys(matches))
+
+
 def _norm(name: str) -> str:
     return name.strip().lower().replace("_", " ").replace("-", " ")
 
@@ -48,20 +61,20 @@ def compute_sensitivity(work_dir: str, ppdf_pattern: str | None = None):
     Sum all matching PPDF files and return:
       (sensitivity_total, sensitivity_mean_per_file, n_files, matching_files)
     """
-    patterns = [
-        ppdf_pattern,
-        os.path.join(work_dir, "position_*_ppdfs_t8_*.hdf5"),
-        os.path.join(work_dir, "position_*_ppdfs.hdf5"),
-        os.path.join(work_dir, "scanner_layouts_*_layout_*_subvoxels.hdf5"),
-    ]
+    if ppdf_pattern:
+        ppdf_files = glob_pattern_list(ppdf_pattern)
+    else:
+        patterns = [
+            os.path.join(work_dir, "position_*_ppdfs_t8_*.hdf5"),
+            os.path.join(work_dir, "position_*_ppdfs.hdf5"),
+            os.path.join(work_dir, "scanner_layouts_*_layout_*_subvoxels.hdf5"),
+        ]
 
-    ppdf_files: list[str] = []
-    for pattern in patterns:
-        if not pattern:
-            continue
-        ppdf_files = sorted(glob.glob(pattern))
-        if ppdf_files:
-            break
+        ppdf_files: list[str] = []
+        for pattern in patterns:
+            ppdf_files = sorted(glob.glob(pattern))
+            if ppdf_files:
+                break
 
     aggregated_ppdfs = None
     successful = 0
@@ -104,13 +117,13 @@ def compute_fwhm_and_asci(
       (fwhm_mean, asci_pct, n_prop_files, n_asci_files)
     """
     if prop_pattern:
-        prop_files = sorted(glob.glob(prop_pattern))
+        prop_files = glob_pattern_list(prop_pattern)
     else:
         aggregate_prop_files = sorted(glob.glob(os.path.join(work_dir, "beams_properties_configuration_[0-9][0-9][0-9].hdf5")))
         prop_files = aggregate_prop_files or sorted(glob.glob(os.path.join(work_dir, "beams_properties_configuration_*.hdf5")))
 
     if asci_pattern:
-        asci_files = sorted(glob.glob(asci_pattern))
+        asci_files = glob_pattern_list(asci_pattern)
     else:
         aggregate_asci_files = sorted(glob.glob(os.path.join(work_dir, "asci_histogram_[0-9][0-9][0-9].hdf5")))
         asci_files = aggregate_asci_files or sorted(glob.glob(os.path.join(work_dir, "asci_histogram_*.hdf5")))

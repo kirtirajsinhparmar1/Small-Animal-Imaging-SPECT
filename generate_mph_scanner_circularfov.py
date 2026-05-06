@@ -36,6 +36,7 @@ def build_sc_spect_detector_rings(
     scint_tangential_mm: float = 0.84,      # width around the ring (tangential width)
     intra_cell_gap_mm: float = 0.84,        # air gap between the pair of crystals in the same cell
     scint_radial_thickness_mm: float = 6.0, # thickness in radial direction (toward/away from center)
+    detector_radial_shift_mm: float = 0.0,  # uniform shift of all detector inner radii
     dtype=torch.float32,
     device: str = "cpu",
 ) -> Tuple[Tensor, Dict]:
@@ -69,7 +70,13 @@ def build_sc_spect_detector_rings(
 
     for ring_idx, (inner_d, n_scint) in enumerate(zip(ring_inner_diameters_mm, detectors_per_ring)):
         n_cells = int(n_scint) // 2  # 2 crystals per cell
-        r_in = inner_d / 2.0
+        r_in = inner_d / 2.0 + detector_radial_shift_mm
+        if r_in <= 0.0:
+            raise ValueError(
+                f"Ring {ring_idx+1}: invalid shifted inner radius {r_in:.3f} mm "
+                f"from inner diameter {inner_d:.3f} mm and detector_radial_shift_mm="
+                f"{detector_radial_shift_mm:.3f} mm"
+            )
         r_c = r_in + H / 2.0         # radius of rectangle centers
         dtheta = 2.0 * math.pi / n_cells
         arc_per_cell = r_c * dtheta
@@ -84,6 +91,9 @@ def build_sc_spect_detector_rings(
         stats.append({
             "ring": ring_idx + 1,
             "inner_diameter_mm": inner_d,
+            "detector_radial_shift_mm": detector_radial_shift_mm,
+            "shifted_inner_radius_mm": r_in,
+            "shifted_inner_diameter_mm": 2.0 * r_in,
             "n_scintillators": n_scint,
             "n_cells": n_cells,
             "radius_center_mm": r_c,
@@ -167,7 +177,7 @@ def sample_apertures_uniform_ring(
 # -------------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate SC-SPECT scanner geometry")
-    parser.add_argument("--aperture_diam", type=float, default=0.4,
+    parser.add_argument("--aperture_diam", "--aperture-diam", dest="aperture_diam", type=float, default=0.4,
                         help="Aperture diameter in mm (default: 0.4)")
     parser.add_argument("--n_apertures", type=int, default=180,
                         help="Number of apertures on HR ring (default: 180)")
@@ -175,6 +185,17 @@ if __name__ == "__main__":
                         help="Scintillator radial thickness in mm (default: 6.0)")
     parser.add_argument("--ring_thickness", type=float, default=2.5,
                         help="HR collimator ring thickness in mm (default: 2.5)")
+    parser.add_argument(
+        "--detector-radial-shift-mm",
+        "--detector_radial_shift_mm",
+        dest="detector_radial_shift_mm",
+        type=float,
+        default=0.0,
+        help=(
+            "Uniform radial shift in mm applied to all detector ring inner radii. "
+            "Positive moves detector rings outward; negative moves inward. Ring spacing remains fixed."
+        ),
+    )
     _here = os.path.dirname(os.path.abspath(__file__))
     parser.add_argument("--output_dir", type=str, default=os.path.join(_here, "data"),
                         help="Output directory for .tensor file (default: ./data)")
@@ -192,6 +213,7 @@ if __name__ == "__main__":
 
     # ===== Detector ring parameters =====
     RING_INNER_DIAMS_MM = [260.0, 390.0, 520.0, 650.0]
+    DETECTOR_RADIAL_SHIFT_MM = cli_args.detector_radial_shift_mm
     DETS_PER_RING       = [40*6*2, 40*9*2, 40*12*2, 40*15*2]  # 3360 total
     SCINT_TANGENT_MM    = 0.84
     SCINT_RADIAL_MM     = cli_args.scint_radial_mm
@@ -207,6 +229,7 @@ if __name__ == "__main__":
         scint_tangential_mm=SCINT_TANGENT_MM,
         intra_cell_gap_mm=INTRA_GAP_MM,
         scint_radial_thickness_mm=SCINT_RADIAL_MM,
+        detector_radial_shift_mm=DETECTOR_RADIAL_SHIFT_MM,
         dtype=torch.float32,
         device="cpu",
     )
@@ -332,6 +355,13 @@ if __name__ == "__main__":
         "scanner MD5": base_scanner_md5,
         "paper_config": {
             "detector_rings_inner_diameters_mm": RING_INNER_DIAMS_MM,
+            "detector_radial_shift_mm": DETECTOR_RADIAL_SHIFT_MM,
+            "detector_rings_shifted_inner_radii_mm": [
+                inner_d / 2.0 + DETECTOR_RADIAL_SHIFT_MM for inner_d in RING_INNER_DIAMS_MM
+            ],
+            "detector_rings_shifted_inner_diameters_mm": [
+                inner_d + 2.0 * DETECTOR_RADIAL_SHIFT_MM for inner_d in RING_INNER_DIAMS_MM
+            ],
             "detectors_per_ring": DETS_PER_RING,
             "scintillator_mm": [SCINT_TANGENT_MM, SCINT_RADIAL_MM, SCINT_AXIAL_MM],
             "intra_cell_gap_mm": INTRA_GAP_MM,
@@ -452,7 +482,7 @@ if __name__ == "__main__":
     H = SCINT_RADIAL_MM
     gap = INTRA_GAP_MM
     required_span = 2 * W + gap
-    ring_centers = [d/2.0 + H/2.0 for d in RING_INNER_DIAMS_MM]
+    ring_centers = [d/2.0 + DETECTOR_RADIAL_SHIFT_MM + H/2.0 for d in RING_INNER_DIAMS_MM]
     cells = [n//2 for n in DETS_PER_RING]
     min_clear = min(r_c * (2*math.pi / n_cell) - required_span for r_c, n_cell in zip(ring_centers, cells))
     print(f"min detector cell clearance: {min_clear:.3f} mm (> 0 means no overlap)")

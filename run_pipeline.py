@@ -45,6 +45,28 @@ def parse_iter_list(value: str) -> list[int]:
     return [int(part.strip()) for part in value.split(",") if part.strip()]
 
 
+def parse_t8_poses(value: str) -> list[int]:
+    poses: list[int] = []
+    seen: set[int] = set()
+    for part in value.split(","):
+        item = part.strip()
+        if not item:
+            continue
+        try:
+            pose_idx = int(item)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(f"Invalid T8 pose index: {item}") from exc
+        if not 0 <= pose_idx <= 7:
+            raise argparse.ArgumentTypeError(f"T8 pose index must be in [0, 7], got {pose_idx}")
+        if pose_idx in seen:
+            raise argparse.ArgumentTypeError(f"Duplicate T8 pose index: {pose_idx}")
+        poses.append(pose_idx)
+        seen.add(pose_idx)
+    if not poses:
+        raise argparse.ArgumentTypeError("At least one T8 pose index is required")
+    return poses
+
+
 def default_cpus() -> int:
     raw_value = os.environ.get("SLURM_CPUS_PER_TASK")
     if raw_value:
@@ -69,6 +91,25 @@ def add_if_set(cmd_args: list[object], flag: str, value: object | None) -> None:
     """Forward output-affecting stage options only when explicitly provided."""
     if value is not None:
         cmd_args.extend([flag, value])
+
+
+RESUME_CONFIG_KEYS = [
+    "layout_idxs",
+    "t8_poses",
+    "aperture_diam",
+    "detector_radial_shift_mm",
+    "n_apertures",
+    "scint_radial_mm",
+    "ring_thickness",
+    "a_mm",
+    "b_mm",
+    "phase_deg",
+    "n_bins",
+    "fwhm_min",
+    "fwhm_max",
+    "img_nx",
+    "img_ny",
+]
 
 
 class Pipeline:
@@ -98,8 +139,23 @@ class Pipeline:
                 print(f"  {path}")
             return
 
+        if self.run_dir.exists() and not self.args.resume and any(self.run_dir.iterdir()):
+            raise FileExistsError(
+                f"Run directory already exists and is not empty: {self.run_dir}. "
+                "Use --resume only when its existing files match this run configuration, or choose a new --run-name."
+            )
+
         for path in dirs:
             path.mkdir(parents=True, exist_ok=True)
+
+        config_path = self.results_dir / "pipeline_config.json"
+        if self.args.resume and config_path.exists():
+            self.validate_resume_config(config_path)
+        elif self.args.resume and self.run_dir.exists() and self.has_resume_outputs():
+            raise FileNotFoundError(
+                f"Refusing --resume without {config_path}. "
+                "Use a new --run-name so reduced-T8 outputs cannot reuse stale analysis files."
+            )
 
         config = {
             "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -111,8 +167,42 @@ class Pipeline:
             "recon_dir": str(self.recon_dir),
             "args": stringify_config(vars(self.args)),
         }
-        config_path = self.results_dir / "pipeline_config.json"
         config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+
+    def validate_resume_config(self, config_path: Path) -> None:
+        try:
+            previous = json.loads(config_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Cannot resume with unreadable pipeline config {config_path}: {exc}") from exc
+
+        previous_args = previous.get("args", {})
+        current_args = stringify_config(vars(self.args))
+        mismatches: list[str] = []
+        for key in RESUME_CONFIG_KEYS:
+            if previous_args.get(key) != current_args.get(key):
+                mismatches.append(
+                    f"{key}: existing={previous_args.get(key)!r}, requested={current_args.get(key)!r}"
+                )
+        if mismatches:
+            preview = "\n".join(mismatches)
+            raise ValueError(
+                f"Refusing --resume because output-affecting options differ in {config_path}:\n{preview}"
+            )
+
+    def has_resume_outputs(self) -> bool:
+        output_patterns = [
+            "scanner_layouts_*.tensor",
+            "position_*_ppdfs_t8_*.hdf5",
+            "beams_masks_configuration_*.hdf5",
+            "beams_properties_configuration_*.hdf5",
+            "asci_histogram_*.hdf5",
+        ]
+        if (self.results_dir / "ji_metrics.csv").exists():
+            return True
+        return any(
+            next(self.data_dir.glob(pattern), None) is not None
+            for pattern in output_patterns
+        )
 
     def run_cmd(self, label: str, cmd: list[str], cwd: Path | None = None) -> None:
         self.stage_counter += 1
@@ -197,10 +287,58 @@ class Pipeline:
 
     def generated_ppdf_files(self) -> list[Path]:
         return [
-            path
+            self.data_dir / f"position_{layout_idx:03d}_ppdfs_t8_{pose_idx:02d}.hdf5"
             for layout_idx in self.args.layout_idxs
-            for path in sorted(self.data_dir.glob(f"position_{layout_idx:03d}_ppdfs_t8_*.hdf5"))
+            for pose_idx in self.args.t8_poses
         ]
+
+    def unexpected_ppdf_files(self) -> list[Path]:
+        selected = {
+            (layout_idx, pose_idx)
+            for layout_idx in self.args.layout_idxs
+            for pose_idx in self.args.t8_poses
+        }
+        unexpected: list[Path] = []
+        for path in sorted(self.data_dir.glob("position_*_ppdfs_t8_*.hdf5")):
+            try:
+                stem_parts = path.stem.split("_")
+                layout_idx = int(stem_parts[1])
+                pose_idx = int(stem_parts[-1])
+            except (IndexError, ValueError):
+                unexpected.append(path)
+                continue
+            if (layout_idx, pose_idx) not in selected:
+                unexpected.append(path)
+        return unexpected
+
+    def unexpected_analysis_files(self) -> list[Path]:
+        expected = {
+            *self.generated_mask_files(),
+            *self.generated_property_files(),
+            *self.generated_asci_files(),
+        }
+        unexpected: list[Path] = []
+        for pattern in [
+            "beams_masks_configuration_*.hdf5",
+            "beams_properties_configuration_*.hdf5",
+            "asci_histogram_*.hdf5",
+        ]:
+            for path in sorted(self.data_dir.glob(pattern)):
+                if path not in expected:
+                    unexpected.append(path)
+        return unexpected
+
+    def ensure_no_unexpected_analysis_files(self) -> None:
+        if self.args.dry_run:
+            return
+        unexpected = self.unexpected_analysis_files()
+        if unexpected:
+            preview = "\n".join(str(path) for path in unexpected[:10])
+            raise FileExistsError(
+                "Found beam/ASCI files outside the requested layout subset. "
+                "They would contaminate downstream JI aggregation:\n"
+                f"{preview}\nUse a clean --run-name or rebuild the stale run directory."
+            )
 
     def generated_mask_files(self) -> list[Path]:
         return [
@@ -252,6 +390,7 @@ class Pipeline:
 
         cmd_args: list[object] = ["--output_dir", self.data_dir]
         add_if_set(cmd_args, "--aperture_diam", self.args.aperture_diam)
+        cmd_args.extend(["--detector-radial-shift-mm", self.args.detector_radial_shift_mm])
         add_if_set(cmd_args, "--n_apertures", self.args.n_apertures)
         add_if_set(cmd_args, "--scint_radial_mm", self.args.scint_radial_mm)
         add_if_set(cmd_args, "--ring_thickness", self.args.ring_thickness)
@@ -271,6 +410,15 @@ class Pipeline:
             source.replace(target)
 
     def stage_ppdf(self) -> None:
+        unexpected = [] if self.args.dry_run else self.unexpected_ppdf_files()
+        if unexpected:
+            preview = "\n".join(str(path) for path in unexpected[:10])
+            raise FileExistsError(
+                "Found T8 PPDF pose files outside the requested --t8-poses subset. "
+                "They would contaminate T8 aggregation:\n"
+                f"{preview}\nUse a clean --run-name or remove/rebuild the stale run directory."
+            )
+
         if not self.args.dry_run and not self.args.resume:
             existing = [
                 path
@@ -289,23 +437,26 @@ class Pipeline:
                 self.layout_file,
                 "--output_dir",
                 self.data_dir,
+                "--pose-idxs",
+                ",".join(str(pose_idx) for pose_idx in self.args.t8_poses),
+                "--pose-workers",
+                self.args.pose_workers,
             ]
             add_if_set(cmd_args, "--a_mm", self.args.a_mm)
             add_if_set(cmd_args, "--b_mm", self.args.b_mm)
             add_if_set(cmd_args, "--phase_deg", self.args.phase_deg)
-            add_if_set(cmd_args, "--pose-workers", self.args.pose_workers)
             add_if_set(cmd_args, "--torch-threads", self.args.torch_threads)
             add_if_set(cmd_args, "--torch-interop-threads", self.args.torch_interop_threads)
             if self.args.resume:
                 cmd_args.append("--skip-existing")
             self.run_cmd(
-                f"parallel PPDF layout {layout_idx:02d}",
+                f"PPDF layout {layout_idx:02d} poses {','.join(f'{pose_idx:02d}' for pose_idx in self.args.t8_poses)}",
                 self.command_with_pairs("arg_ppdf_t8.py", cmd_args),
             )
-        for layout_idx in self.args.layout_idxs:
-            self.expect_glob(f"data/position_{layout_idx:03d}_ppdfs_t8_*.hdf5", 1, "PPDF")
+        self.expect_all_exist(self.generated_ppdf_files(), "selected T8 PPDF")
 
     def stage_masks(self) -> None:
+        self.ensure_no_unexpected_analysis_files()
         for layout_idx in self.args.layout_idxs:
             out_path = self.data_dir / f"beams_masks_configuration_{layout_idx:03d}.hdf5"
             if not self.args.dry_run and out_path.exists():
@@ -328,6 +479,7 @@ class Pipeline:
         self.expect_all_exist(self.generated_mask_files(), "beam mask")
 
     def stage_properties(self) -> None:
+        self.ensure_no_unexpected_analysis_files()
         for layout_idx in self.args.layout_idxs:
             out_path = self.data_dir / f"beams_properties_configuration_{layout_idx:03d}.hdf5"
             if not self.args.dry_run and out_path.exists():
@@ -350,6 +502,7 @@ class Pipeline:
         self.expect_all_exist(self.generated_property_files(), "beam property")
 
     def stage_asci(self) -> None:
+        self.ensure_no_unexpected_analysis_files()
         for layout_idx in self.args.layout_idxs:
             out_path = self.data_dir / f"asci_histogram_{layout_idx:03d}.hdf5"
             if not self.args.dry_run and out_path.exists():
@@ -374,6 +527,7 @@ class Pipeline:
         return cmd_args
 
     def stage_ji(self) -> Path:
+        self.ensure_no_unexpected_analysis_files()
         ji_csv = self.results_dir / "ji_metrics.csv"
         if not self.args.dry_run and ji_csv.exists():
             if self.args.resume:
@@ -393,6 +547,14 @@ class Pipeline:
         add_if_set(cmd_args, "--img-nx", self.args.img_nx)
         add_if_set(cmd_args, "--img-ny", self.args.img_ny)
         add_if_set(cmd_args, "--n-bins", self.args.n_bins)
+        cmd_args.extend([
+            "--ppdf-pattern",
+            ",".join(str(path) for path in self.generated_ppdf_files()),
+            "--prop-pattern",
+            ",".join(str(path) for path in self.generated_property_files()),
+            "--asci-pattern",
+            ",".join(str(path) for path in self.generated_asci_files()),
+        ])
         if self.args.ji_force_zero:
             cmd_args.append("--force-zero")
             add_if_set(cmd_args, "--reason", self.args.ji_zero_reason)
@@ -446,6 +608,8 @@ class Pipeline:
             flist,
             "--layout-idxs",
             ",".join(str(idx) for idx in self.args.layout_idxs),
+            "--t8-poses",
+            ",".join(str(pose_idx) for pose_idx in self.args.t8_poses),
         ]
         return cmd_args
 
@@ -595,6 +759,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dry-run", action="store_true", help="Print commands and output layout without executing stages.")
 
     parser.add_argument("--aperture-diam", type=float, default=None)
+    parser.add_argument("--detector-radial-shift-mm", type=float, default=0.0)
     parser.add_argument("--n-apertures", type=int, default=None)
     parser.add_argument("--scint-radial-mm", type=float, default=None)
     parser.add_argument("--ring-thickness", type=float, default=None)
@@ -602,6 +767,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--a-mm", type=float, default=None, help="T8 aperture spacing a passed to arg_ppdf_t8.py.")
     parser.add_argument("--b-mm", type=float, default=None, help="T8 aperture spacing b passed to arg_ppdf_t8.py.")
     parser.add_argument("--phase-deg", type=float, default=None)
+    parser.add_argument(
+        "--t8-poses",
+        type=parse_t8_poses,
+        default=parse_t8_poses("0,1,2,3,4,5,6,7"),
+        help="Comma-separated T8 pose indices to generate/use, e.g. 0,2,4,6. Defaults to all 8 poses.",
+    )
     parser.add_argument("--cpus", type=int, default=default_cpus())
     parser.add_argument("--pose-workers", type=int, default=None)
     parser.add_argument("--torch-threads", type=int, default=None)
@@ -633,9 +804,17 @@ def build_parser() -> argparse.ArgumentParser:
 def normalize_args(args: argparse.Namespace) -> argparse.Namespace:
     if args.run_name is None:
         args.run_name = datetime.now().strftime("run_%Y%m%d_%H%M%S")
-    args.pose_workers = args.pose_workers or max(1, args.cpus // 2)
-    args.pose_workers = max(1, args.pose_workers)
-    args.torch_threads = args.torch_threads or max(1, args.cpus // args.pose_workers)
+    args.cpus = max(1, args.cpus)
+    selected_pose_count = max(1, len(args.t8_poses))
+    if args.pose_workers is None:
+        args.pose_workers = min(selected_pose_count, max(1, args.cpus // 4))
+    else:
+        args.pose_workers = max(1, args.pose_workers)
+    args.pose_workers = min(args.pose_workers, selected_pose_count, 8)
+    if args.torch_threads is None:
+        args.torch_threads = max(1, args.cpus // args.pose_workers)
+    else:
+        args.torch_threads = max(1, args.torch_threads)
     if args.torch_interop_threads is not None:
         args.torch_interop_threads = max(1, args.torch_interop_threads)
     return args
