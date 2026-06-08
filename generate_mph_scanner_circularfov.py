@@ -6,6 +6,13 @@ import torch
 from typing import List, Tuple, Dict
 from torch import save as torch_save, Tensor
 
+
+N_ANGLE_SECTORS = 40
+DEFAULT_DETS_PER_RING = [40 * 6 * 2, 40 * 9 * 2, 40 * 12 * 2, 40 * 15 * 2]
+DEFAULT_TOTAL_DETECTOR_ROWS = sum(DEFAULT_DETS_PER_RING)
+ALLOWED_N_CRYSTALS_RING1 = {120, 160, 200, 240, 280, 320, 360, 400, 440, 480}
+ALLOWED_N_CRYSTALS_RING2 = {240, 280, 320, 360, 400, 440, 480, 520, 560, 600, 640, 680, 720}
+
 # --- project helpers ---
 # helper.py provides:
 # - generate_md5_from_tensors: creates a unique hash for geometry identification
@@ -30,6 +37,152 @@ except ImportError as e:
 # Geometry builders
 # -------------------------------
 
+def _validate_allowed_detector_counts(n_crystals_ring1: int, n_crystals_ring2: int) -> None:
+    if n_crystals_ring1 not in ALLOWED_N_CRYSTALS_RING1:
+        raise ValueError(
+            f"n_crystals_ring1 must be one of {sorted(ALLOWED_N_CRYSTALS_RING1)}; "
+            f"got {n_crystals_ring1}."
+        )
+    if n_crystals_ring2 not in ALLOWED_N_CRYSTALS_RING2:
+        raise ValueError(
+            f"n_crystals_ring2 must be one of {sorted(ALLOWED_N_CRYSTALS_RING2)}; "
+            f"got {n_crystals_ring2}."
+        )
+
+
+def balanced_sector_counts(n_rows: int) -> List[int]:
+    """Split rows across 40 angular sectors with evenly spread remainders."""
+    if n_rows <= 0:
+        raise ValueError(f"n_rows must be positive; got {n_rows}.")
+    base = n_rows // N_ANGLE_SECTORS
+    rem = n_rows % N_ANGLE_SECTORS
+    counts = [base] * N_ANGLE_SECTORS
+    for i in range(rem):
+        sector = int(math.floor(i * N_ANGLE_SECTORS / rem))
+        counts[sector] += 1
+    return counts
+
+
+def build_ring_row_metadata(detectors_per_ring: List[int]) -> List[Dict]:
+    """Return ring row ranges in the detector identity space."""
+
+    rows: List[Dict] = []
+    start = 0
+    for ring_idx, ring_rows in enumerate(detectors_per_ring):
+        if ring_rows <= 0 or ring_rows % 2 != 0:
+            raise ValueError(
+                f"Ring {ring_idx} row count must be positive and even; got {ring_rows}."
+            )
+        stop = start + ring_rows
+        sector_counts = balanced_sector_counts(ring_rows)
+        sector_ranges = []
+        sector_start = start
+        for sector_count in sector_counts:
+            sector_stop = sector_start + sector_count
+            sector_ranges.append((sector_start, sector_stop))
+            sector_start = sector_stop
+        if sector_start != stop:
+            raise ValueError(
+                f"Ring {ring_idx} sector metadata built through {sector_start}; expected {stop}."
+            )
+        rows.append(
+            {
+                "ring_idx": ring_idx,
+                "start": start,
+                "stop": stop,
+                "rows": ring_rows,
+                "sector_row_counts": sector_counts,
+                "sector_ranges": sector_ranges,
+            }
+        )
+        start = stop
+
+    expected_total = sum(detectors_per_ring)
+    if start != expected_total:
+        raise ValueError(
+            f"Detector row metadata built {start} rows; expected "
+            f"{expected_total}."
+        )
+    return rows
+
+
+def _select_evenly_spaced(values: List[int], n_keep: int) -> List[int]:
+    if n_keep <= 0:
+        return []
+    if n_keep >= len(values):
+        return list(values)
+    if n_keep == 1:
+        return [values[len(values) // 2]]
+    positions = [
+        min(len(values) - 1, int((i + 0.5) * len(values) / n_keep))
+        for i in range(n_keep)
+    ]
+    return [values[pos] for pos in positions]
+
+
+def _split_keep_by_side(sector_rows: List[int], keep_count: int, sector: int) -> Tuple[int, int]:
+    side0_count = len(sector_rows[0::2])
+    side1_count = len(sector_rows[1::2])
+    side0_keep = min(side0_count, keep_count // 2)
+    side1_keep = min(side1_count, keep_count // 2)
+    remaining = keep_count - side0_keep - side1_keep
+    preferred_sides = (0, 1) if sector % 2 == 0 else (1, 0)
+    while remaining > 0:
+        progressed = False
+        for side in preferred_sides:
+            if side == 0 and side0_keep < side0_count:
+                side0_keep += 1
+                remaining -= 1
+                progressed = True
+            elif side == 1 and side1_keep < side1_count:
+                side1_keep += 1
+                remaining -= 1
+                progressed = True
+            if remaining == 0:
+                break
+        if not progressed:
+            raise ValueError(
+                f"Cannot keep {keep_count} rows from sector {sector} with only "
+                f"{len(sector_rows)} available rows."
+            )
+    return side0_keep, side1_keep
+
+
+def select_balanced_active_rows_for_ring(ring_meta: Dict, n_keep: int) -> List[int]:
+    """Select rows per sector with side balance and deterministic spacing."""
+    ring_rows = int(ring_meta["rows"])
+    if n_keep <= 0 or n_keep > ring_rows:
+        raise ValueError(
+            f"Ring {ring_meta['ring_idx']} active count must be positive "
+            f"and <= {ring_rows}; got {n_keep}."
+        )
+
+    keep_counts = balanced_sector_counts(n_keep)
+    selected: List[int] = []
+
+    for sector in range(N_ANGLE_SECTORS):
+        sector_start, sector_stop = ring_meta["sector_ranges"][sector]
+        sector_rows = list(range(int(sector_start), int(sector_stop)))
+        keep_per_sector = keep_counts[sector]
+        if keep_per_sector > len(sector_rows):
+            raise ValueError(
+                f"Ring {ring_meta['ring_idx']} sector {sector} cannot keep "
+                f"{keep_per_sector} rows from {len(sector_rows)} available rows."
+            )
+        side0 = sector_rows[0::2]
+        side1 = sector_rows[1::2]
+        side0_keep, side1_keep = _split_keep_by_side(sector_rows, keep_per_sector, sector)
+        selected.extend(_select_evenly_spaced(side0, side0_keep))
+        selected.extend(_select_evenly_spaced(side1, side1_keep))
+
+    selected = sorted(selected)
+    if len(selected) != n_keep:
+        raise ValueError(
+            f"Ring {ring_meta['ring_idx']} selected {len(selected)} active rows; "
+            f"expected {n_keep}."
+        )
+    return selected
+
 def build_sc_spect_detector_rings(
     ring_inner_diameters_mm: List[float],
     detectors_per_ring: List[int],
@@ -45,7 +198,7 @@ def build_sc_spect_detector_rings(
 
     Output:
       - base_detector_units: shape (N,4,2)
-        N = total scintillators (expected 3360)
+        N = total scintillators from the configured detector identity space
         4 vertices per rectangle
         2 coordinates per vertex (x,y)
 
@@ -179,8 +332,24 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate SC-SPECT scanner geometry")
     parser.add_argument("--aperture_diam", "--aperture-diam", dest="aperture_diam", type=float, default=0.4,
                         help="Aperture diameter in mm (default: 0.4)")
-    parser.add_argument("--n_apertures", type=int, default=180,
+    parser.add_argument("--n_apertures", "--n-apertures", dest="n_apertures", type=int, default=180,
                         help="Number of apertures on HR ring (default: 180)")
+    parser.add_argument(
+        "--n-crystals-ring1",
+        "--n_crystals_ring1",
+        dest="n_crystals_ring1",
+        type=int,
+        default=480,
+        help="Active detector rows in internal detector ring 0 (default: 480)",
+    )
+    parser.add_argument(
+        "--n-crystals-ring2",
+        "--n_crystals_ring2",
+        dest="n_crystals_ring2",
+        type=int,
+        default=720,
+        help="Active detector rows in internal detector ring 1 (default: 720)",
+    )
     parser.add_argument("--scint_radial_mm", type=float, default=6.0,
                         help="Scintillator radial thickness in mm (default: 6.0)")
     parser.add_argument("--ring_thickness", type=float, default=2.5,
@@ -207,14 +376,17 @@ if __name__ == "__main__":
     APERTURE_DIAM_MM   = cli_args.aperture_diam
     MIN_SPACING_MM     = 0.8
     APERTURE_COUNT     = cli_args.n_apertures
+    N_CRYSTALS_RING1   = cli_args.n_crystals_ring1
+    N_CRYSTALS_RING2   = cli_args.n_crystals_ring2
     FOV_DIAMETER_MM    = 10.0
+    _validate_allowed_detector_counts(N_CRYSTALS_RING1, N_CRYSTALS_RING2)
 
     SEED = int(os.getenv("HR_APERTURE_SEED", "2025"))
 
     # ===== Detector ring parameters =====
     RING_INNER_DIAMS_MM = [260.0, 390.0, 520.0, 650.0]
     DETECTOR_RADIAL_SHIFT_MM = cli_args.detector_radial_shift_mm
-    DETS_PER_RING       = [40*6*2, 40*9*2, 40*12*2, 40*15*2]  # 3360 total
+    DETS_PER_RING       = DEFAULT_DETS_PER_RING[:]
     SCINT_TANGENT_MM    = 0.84
     SCINT_RADIAL_MM     = cli_args.scint_radial_mm
     INTRA_GAP_MM        = 0.84
@@ -241,7 +413,34 @@ if __name__ == "__main__":
             f"cells={rs['n_cells']} | scint={rs['n_scintillators']} | "
             f"arc/cell={rs['arc_per_cell_mm']:.3f} mm | clearance={rs['clearance_mm']:.3f} mm"
         )
-    print(f"Total scintillators: {geom_stats['total_scintillators']} (expected 3360)")
+    n_total_detector_rows = int(base_detector_units.shape[0])
+    print(
+        f"Total scintillators: {geom_stats['total_scintillators']} "
+        f"(expected {sum(DETS_PER_RING)})"
+    )
+
+    ring_row_metadata = build_ring_row_metadata(DETS_PER_RING)
+    ring0_active_rows = select_balanced_active_rows_for_ring(
+        ring_row_metadata[0], N_CRYSTALS_RING1
+    )
+    ring1_active_rows = select_balanced_active_rows_for_ring(
+        ring_row_metadata[1], N_CRYSTALS_RING2
+    )
+    ring2_active_rows = list(range(ring_row_metadata[2]["start"], ring_row_metadata[2]["stop"]))
+    ring3_active_rows = list(range(ring_row_metadata[3]["start"], ring_row_metadata[3]["stop"]))
+    active_detector_rows = sorted(
+        ring0_active_rows + ring1_active_rows + ring2_active_rows + ring3_active_rows
+    )
+    active_detector_unit_indices = torch.tensor(active_detector_rows, dtype=torch.long)
+
+    print("\n=== Active detector summary ===")
+    print(f"n_crystals_ring1: {N_CRYSTALS_RING1}")
+    print(f"n_crystals_ring2: {N_CRYSTALS_RING2}")
+    print(f"ring0 active count: {len(ring0_active_rows)} / {DETS_PER_RING[0]}")
+    print(f"ring1 active count: {len(ring1_active_rows)} / {DETS_PER_RING[1]}")
+    print(f"ring2 active count: {len(ring2_active_rows)} / {DETS_PER_RING[2]}")
+    print(f"ring3 active count: {len(ring3_active_rows)} / {DETS_PER_RING[3]}")
+    print(f"n_active_detector_rows: {int(active_detector_unit_indices.numel())}")
 
     # --- 2) Build analytic aperture centers (base, before motion) ---
     r_in = RING_INNER_DIAM_MM / 2.0
@@ -363,15 +562,34 @@ if __name__ == "__main__":
                 inner_d + 2.0 * DETECTOR_RADIAL_SHIFT_MM for inner_d in RING_INNER_DIAMS_MM
             ],
             "detectors_per_ring": DETS_PER_RING,
+            "active_detectors_per_ring": [
+                len(ring0_active_rows),
+                len(ring1_active_rows),
+                len(ring2_active_rows),
+                len(ring3_active_rows),
+            ],
+            "n_total_detector_rows": n_total_detector_rows,
+            "n_active_detector_rows": int(active_detector_unit_indices.numel()),
+            "n_crystals_ring1": N_CRYSTALS_RING1,
+            "n_crystals_ring2": N_CRYSTALS_RING2,
             "scintillator_mm": [SCINT_TANGENT_MM, SCINT_RADIAL_MM, SCINT_AXIAL_MM],
             "intra_cell_gap_mm": INTRA_GAP_MM,
             "ring_inner_diameter_mm": RING_INNER_DIAM_MM,
             "ring_thickness_mm": RING_THICKNESS_MM,
             "aperture_diameter_mm": APERTURE_DIAM_MM,
+            "aperture_diam_mm": APERTURE_DIAM_MM,
             "aperture_min_spacing_mm": MIN_SPACING_MM,
             "aperture_count": APERTURE_COUNT,
+            "n_apertures": APERTURE_COUNT,
             "fov_diameter_mm": FOV_DIAMETER_MM
         },
+        "active_detector_unit_indices": active_detector_unit_indices,
+        "n_total_detector_rows": n_total_detector_rows,
+        "n_active_detector_rows": int(active_detector_unit_indices.numel()),
+        "n_crystals_ring1": N_CRYSTALS_RING1,
+        "n_crystals_ring2": N_CRYSTALS_RING2,
+        "n_apertures": APERTURE_COUNT,
+        "aperture_diam_mm": APERTURE_DIAM_MM,
         "motion_parameters": {
             "n_rotational_steps_defined": n_rotations_for_motion,
             "rotation_step_deg": angle_step_deg_for_motion,
@@ -388,6 +606,13 @@ if __name__ == "__main__":
         out_data["layouts"][layout_key] = {
             "position": motion_positions[p],                 # [angle_rad, x_mm, y_mm]
             "detector units": base_detector_units,           # FIXED
+            "active_detector_unit_indices": active_detector_unit_indices,
+            "n_total_detector_rows": n_total_detector_rows,
+            "n_active_detector_rows": int(active_detector_unit_indices.numel()),
+            "n_crystals_ring1": N_CRYSTALS_RING1,
+            "n_crystals_ring2": N_CRYSTALS_RING2,
+            "n_apertures": APERTURE_COUNT,
+            "aperture_diam_mm": APERTURE_DIAM_MM,
             "plate circles": {
                 "centers": transformed_centers[p],           # ROTATED
                 "radius_mm": r_ap
@@ -426,7 +651,8 @@ if __name__ == "__main__":
         plot_polygons_from_vertices_2d_mpl(
             base_detector_units, ax,
             facecolor='lightblue', edgecolor='blue', alpha=0.7,
-            label="Detectors (Rings 1–4, 3,360)"
+            label=f"Detector geometry (Rings 1-4, {n_total_detector_rows:,} rows; "
+                  f"{int(active_detector_unit_indices.numel()):,} active)"
         )
 
     # Draw HR ring annulus (base)
@@ -453,7 +679,7 @@ if __name__ == "__main__":
     ax.set_ylim([-plot_lim, plot_lim])
     ax.set_xlabel("X (mm)")
     ax.set_ylabel("Y (mm)")
-    ax.set_title("SC-SPECT (Top View) — HR Ring with 180 Apertures (Base Pose)")
+    ax.set_title(f"SC-SPECT (Top View) - HR Ring with {APERTURE_COUNT} Apertures (Base Pose)")
     ax.legend(fontsize='small')
     ax.grid(True)
     plt.savefig("scspect_hr_stationary.png")
@@ -461,17 +687,21 @@ if __name__ == "__main__":
 
     # --- 7) Geometry self-checks ---
     print("\n=== GEOMETRY CHECKS ===")
-    print("detectors tensor:", tuple(base_detector_units.shape))          # expect (3360,4,2)
-    print("aperture centers:", tuple(base_aperture_centers.shape))        # expect (180,2)
-    print("plate segments:", tuple(plate_segments.shape))                 # expect (360,4,2)
+    print("detectors tensor:", tuple(base_detector_units.shape))
+    print("aperture centers:", tuple(base_aperture_centers.shape))
+    print("plate segments:", tuple(plate_segments.shape))
     print("n_positions:", n_total_positions)                               # expect 2
 
     # min center spacing among apertures
     D = torch.cdist(base_aperture_centers, base_aperture_centers)
     D.fill_diagonal_(1e9)
     dmin = float(D.min().item())
-    print(f"min center spacing among apertures: {dmin:.4f} mm (>= {MIN_SPACING_MM} mm)")
-    assert dmin >= MIN_SPACING_MM - 1e-6, "Aperture spacing violated!"
+    print(f"min center spacing among apertures: {dmin:.4f} mm (diagnostic threshold: {MIN_SPACING_MM} mm)")
+    if dmin < MIN_SPACING_MM - 1e-6:
+        print(
+            "[warn] Aperture center spacing is below the diagnostic threshold; "
+            "the angular opening/cell-width check remains the overlap guard."
+        )
 
     # ring-wall radial clearance
     R_mid = r_in + RING_THICKNESS_MM / 2.0

@@ -12,6 +12,35 @@ def get_flist(input_file: str) -> list:
         flist = [x.strip() for x in flist]
         return flist
 
+
+def infer_ppdf_projection_width(flist: list, sfov_expected: int) -> int:
+    if not flist:
+        raise RuntimeError("Empty flist; cannot infer projection width.")
+
+    reference_shape = None
+    for fname in flist:
+        with h5py.File(fname, "r") as h5f:
+            if "ppdfs" not in h5f:
+                raise KeyError(f"{fname} does not contain dataset 'ppdfs'")
+            current_shape = tuple(h5f["ppdfs"].shape)
+
+        if len(current_shape) != 2:
+            raise ValueError(f"{fname} ppdfs must be 2D, got shape {current_shape}")
+        if current_shape[1] != sfov_expected:
+            raise ValueError(
+                f"{fname} ppdfs second dimension {current_shape[1]} does not match "
+                f"expected source pixels {sfov_expected}"
+            )
+        if reference_shape is None:
+            reference_shape = current_shape
+        elif current_shape != reference_shape:
+            raise ValueError(
+                f"All PPDF matrices must have the same shape for projection. "
+                f"Expected {reference_shape}, got {current_shape} in {fname}"
+            )
+
+    return int(reference_shape[0])
+
 if __name__ == "__main__":
 
     # --- Setup ---
@@ -34,7 +63,8 @@ if __name__ == "__main__":
 
     IMG_SIZE = 200
     sfov_expected = IMG_SIZE * IMG_SIZE
-    sproj = 3360
+    sproj = infer_ppdf_projection_width(flist, sfov_expected)
+    print(f"Inferred projection bins from PPDF shape: {sproj}")
 
     # --- Phantom Loading and Resizing ---
     phantom_data = torch.load(args.phantom, map_location="cpu")
@@ -70,7 +100,13 @@ if __name__ == "__main__":
         task = progress.add_task("[green]Projecting (T8 matrices)...", total=len(flist))
         for fname in flist:
             with h5py.File(fname, "r") as h5f:
-                matrix_chunk = torch.tensor(h5f["ppdfs"][:]).view(1, sproj, sfov_expected)
+                matrix_np = h5f["ppdfs"][:]
+                if matrix_np.shape != (sproj, sfov_expected):
+                    raise ValueError(
+                        f"{fname} ppdfs shape {matrix_np.shape} does not match "
+                        f"expected {(sproj, sfov_expected)}"
+                    )
+                matrix_chunk = torch.from_numpy(matrix_np).to(dtype=torch.float32).view(1, sproj, sfov_expected)
                 proj_chunk = torch.matmul(matrix_chunk, phantom_flat)
                 all_projs.append(proj_chunk)
 

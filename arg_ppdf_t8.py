@@ -11,6 +11,8 @@ import concurrent.futures
 import multiprocessing as mp
 from typing import Optional
 
+from srm_row_sampling import make_sampled_detector_rows, write_row_sampling_metadata
+
 def ellipse_offsets_t8(a_mm: float = 0.2, b_mm: float = 0.2, phase_deg: float = 0.0):
     """8 bed positions on an ellipse (a,b) in mm."""
     phase = np.deg2rad(phase_deg)
@@ -55,6 +57,59 @@ def _set_torch_threads(torch_threads: Optional[int], interop_threads: Optional[i
             pass
 
 
+def _to_numpy_int64(value):
+    if value is None:
+        return None
+    if hasattr(value, "detach"):
+        value = value.detach().cpu().numpy()
+    return np.asarray(value, dtype=np.int64)
+
+
+def _scalar_or_none(value):
+    if value is None:
+        return None
+    if hasattr(value, "detach"):
+        value = value.detach().cpu()
+    if hasattr(value, "item"):
+        return value.item()
+    return value
+
+
+def _layout_metadata(scanner_layouts, layout_idx: int) -> dict:
+    if not isinstance(scanner_layouts, dict):
+        return {}
+    top_level = {
+        key: scanner_layouts.get(key)
+        for key in (
+            "active_detector_unit_indices",
+            "n_total_detector_rows",
+            "n_active_detector_rows",
+            "n_crystals_ring1",
+            "n_crystals_ring2",
+            "n_apertures",
+            "aperture_diam_mm",
+        )
+        if key in scanner_layouts
+    }
+    layout_entry = scanner_layouts.get(f"position {layout_idx:03d}", {})
+    if isinstance(layout_entry, dict):
+        top_level.update(layout_entry)
+    return top_level
+
+
+def _extra_sampling_attrs(layout_meta: dict) -> dict:
+    return {
+        key: _scalar_or_none(layout_meta.get(key))
+        for key in (
+            "n_crystals_ring1",
+            "n_crystals_ring2",
+            "n_apertures",
+            "aperture_diam_mm",
+            "n_active_detector_rows",
+        )
+    }
+
+
 def _compute_pose_worker(
     *,
     layout_idx: int,
@@ -66,6 +121,9 @@ def _compute_pose_worker(
     torch_threads: Optional[int],
     torch_interop_threads: Optional[int],
     skip_existing: bool,
+    srm_row_fraction: float,
+    srm_row_mode: str,
+    srm_row_seed: int,
 ):
     _set_torch_threads(torch_threads, torch_interop_threads)
     from scanner_modeling.geometry_2d import load_scanner_layouts
@@ -87,6 +145,9 @@ def _compute_pose_worker(
         scanner_layouts=scanner_layouts,
         layouts_md5=layouts_md5,
         output_dir=output_dir,
+        srm_row_fraction=srm_row_fraction,
+        srm_row_mode=srm_row_mode,
+        srm_row_seed=srm_row_seed,
     )
 
 def compute_pose(
@@ -98,8 +159,11 @@ def compute_pose(
     scanner_layouts,
     layouts_md5: str,
     output_dir: str,
+    srm_row_fraction: float = 1.0,
+    srm_row_mode: str = "ring_cell_random",
+    srm_row_seed: int = 42,
 ):
-    from torch import arange, device, get_num_threads, tensor
+    from torch import device, get_num_threads, tensor
     from scanner_modeling._raytracer_2d._local_functions import (
         ppdf_2d_local,
         reduced_edges_2d_local,
@@ -134,7 +198,28 @@ def compute_pose(
     ) = load_scanner_geometry_from_layout(layout_idx, scanner_layouts)
 
     n_crystals_total = int(crystal_objects_vertices.shape[0])
-    crystal_idx_tensor = arange(n_crystals_total)
+    layout_meta = _layout_metadata(scanner_layouts, layout_idx)
+    active_detector_unit_indices = _to_numpy_int64(
+        layout_meta.get("active_detector_unit_indices")
+    )
+    if active_detector_unit_indices is None:
+        active_detector_unit_indices = np.arange(n_crystals_total, dtype=np.int64)
+
+    sampled_rows = make_sampled_detector_rows(
+        total_rows=n_crystals_total,
+        fraction=srm_row_fraction,
+        mode=srm_row_mode,
+        seed=srm_row_seed,
+        active_detector_unit_indices=active_detector_unit_indices,
+    )
+    n_active_rows = int(len(active_detector_unit_indices))
+    n_sampled_rows = len(sampled_rows)
+    print(
+        "  SRM row sampling: "
+        f"fraction={srm_row_fraction}, mode={srm_row_mode}, seed={srm_row_seed}, "
+        f"sampled={n_sampled_rows}/{n_active_rows} active detector rows, "
+        f"total_identity={n_crystals_total}"
+    )
 
     # Translation implemented by shifting FOV center
     fov_dict = fov_tensor_dict(
@@ -171,10 +256,20 @@ def compute_pose(
         h5file.attrs["dy_mm"] = float(dy)
         h5file.attrs["pose_tag"] = "t8"
 
-        dset = h5file.create_dataset("ppdfs", (n_crystals_total, fov_n_pxs), dtype="f")
+        dset = h5file.create_dataset("ppdfs", (n_sampled_rows, fov_n_pxs), dtype="f")
+        write_row_sampling_metadata(
+            h5file,
+            sampled_rows,
+            fraction=srm_row_fraction,
+            mode=srm_row_mode,
+            seed=srm_row_seed,
+            total_rows=n_crystals_total,
+            active_detector_unit_indices=active_detector_unit_indices,
+            extra_attrs=_extra_sampling_attrs(layout_meta),
+        )
 
-        for dataset_idx, crystal_idx_tensor_val in enumerate(crystal_idx_tensor):
-            crystal_idx = int(crystal_idx_tensor_val.item())
+        for local_row_idx, crystal_idx in enumerate(sampled_rows):
+            crystal_idx = int(crystal_idx)
 
             reduced_crystal_edges_sfovs = []
             reduced_plate_edges_sfovs = []
@@ -198,10 +293,10 @@ def compute_pose(
                     mu_dict,
                     default_device,
                 )
-                dset[dataset_idx, sfov_pxs_ids_1d[sfov_idx]] = ppdf_slice.cpu().numpy()
+                dset[local_row_idx, sfov_pxs_ids_1d[sfov_idx]] = ppdf_slice.cpu().numpy()
 
-            if (dataset_idx + 1) % 200 == 0:
-                print(f"    computed {dataset_idx+1}/{n_crystals_total} crystals...")
+            if (local_row_idx + 1) % 200 == 0:
+                print(f"    computed {local_row_idx+1}/{n_sampled_rows} sampled detector rows...")
 
     print(f"  done in {time.time()-t0:.2f} s")
     return out_path
@@ -229,6 +324,13 @@ def main():
                     help="torch.set_num_interop_threads() inside each worker (default: auto)")
     ap.add_argument("--skip-existing", action="store_true",
                     help="if set, skip poses whose output HDF5 already exists")
+    ap.add_argument("--srm-row-fraction", type=float, default=1.0,
+                    help="fraction of detector-response rows to compute and store (default: 1.0)")
+    ap.add_argument("--srm-row-mode", type=str, default="ring_cell_random",
+                    choices=["all", "every_k", "evenly_spaced", "random", "ring_cell_stratified", "ring_cell_random"],
+                    help="detector-row sampling mode (default: ring_cell_random)")
+    ap.add_argument("--srm-row-seed", type=int, default=42,
+                    help="random seed for detector-row sampling modes (default: 42)")
     args = ap.parse_args()
 
     from scanner_modeling.geometry_2d import load_scanner_layouts
@@ -275,6 +377,9 @@ def main():
             scanner_layouts=scanner_layouts,
             layouts_md5=layouts_md5,
             output_dir=args.output_dir,
+            srm_row_fraction=args.srm_row_fraction,
+            srm_row_mode=args.srm_row_mode,
+            srm_row_seed=args.srm_row_seed,
         )
     else:
         selected_jobs = [(pose_idx, poses[pose_idx]) for pose_idx in selected_pose_indices]
@@ -297,6 +402,9 @@ def main():
                     scanner_layouts=scanner_layouts,
                     layouts_md5=layouts_md5,
                     output_dir=args.output_dir,
+                    srm_row_fraction=args.srm_row_fraction,
+                    srm_row_mode=args.srm_row_mode,
+                    srm_row_seed=args.srm_row_seed,
                 )
         else:
             # Use separate worker processes per pose; each worker reloads the layout tensor.
@@ -324,6 +432,9 @@ def main():
                             torch_threads=args.torch_threads,
                             torch_interop_threads=args.torch_interop_threads,
                             skip_existing=bool(args.skip_existing),
+                            srm_row_fraction=args.srm_row_fraction,
+                            srm_row_mode=args.srm_row_mode,
+                            srm_row_seed=args.srm_row_seed,
                         )
                     )
                 for fut in concurrent.futures.as_completed(futures):

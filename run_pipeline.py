@@ -96,14 +96,20 @@ def add_if_set(cmd_args: list[object], flag: str, value: object | None) -> None:
 RESUME_CONFIG_KEYS = [
     "layout_idxs",
     "t8_poses",
+    "layout_file",
     "aperture_diam",
     "detector_radial_shift_mm",
     "n_apertures",
+    "n_crystals_ring1",
+    "n_crystals_ring2",
     "scint_radial_mm",
     "ring_thickness",
     "a_mm",
     "b_mm",
     "phase_deg",
+    "srm_row_fraction",
+    "srm_row_mode",
+    "srm_row_seed",
     "n_bins",
     "fwhm_min",
     "fwhm_max",
@@ -377,6 +383,13 @@ class Pipeline:
         return sorted(set(indices))
 
     def stage_geometry(self) -> None:
+        if self.args.layout_file is not None:
+            self.layout_file = Path(self.args.layout_file).expanduser().resolve()
+            if not self.layout_file.exists():
+                raise FileNotFoundError(f"Requested layout tensor does not exist: {self.layout_file}")
+            print(f"Skipping geometry generation; using requested layout {self.layout_file}")
+            return
+
         if not self.args.dry_run:
             tensors = self.existing_layout_tensors()
             if tensors and self.args.resume:
@@ -392,6 +405,8 @@ class Pipeline:
         add_if_set(cmd_args, "--aperture_diam", self.args.aperture_diam)
         cmd_args.extend(["--detector-radial-shift-mm", self.args.detector_radial_shift_mm])
         add_if_set(cmd_args, "--n_apertures", self.args.n_apertures)
+        add_if_set(cmd_args, "--n-crystals-ring1", self.args.n_crystals_ring1)
+        add_if_set(cmd_args, "--n-crystals-ring2", self.args.n_crystals_ring2)
         add_if_set(cmd_args, "--scint_radial_mm", self.args.scint_radial_mm)
         add_if_set(cmd_args, "--ring_thickness", self.args.ring_thickness)
         cmd = self.command_with_pairs("generate_mph_scanner_circularfov.py", cmd_args)
@@ -447,6 +462,14 @@ class Pipeline:
             add_if_set(cmd_args, "--phase_deg", self.args.phase_deg)
             add_if_set(cmd_args, "--torch-threads", self.args.torch_threads)
             add_if_set(cmd_args, "--torch-interop-threads", self.args.torch_interop_threads)
+            cmd_args.extend([
+                "--srm-row-fraction",
+                self.args.srm_row_fraction,
+                "--srm-row-mode",
+                self.args.srm_row_mode,
+                "--srm-row-seed",
+                self.args.srm_row_seed,
+            ])
             if self.args.resume:
                 cmd_args.append("--skip-existing")
             self.run_cmd(
@@ -726,6 +749,11 @@ class Pipeline:
         if self.args.skip_recon:
             print("Skipping projection, MLEM, and NPZ viewing because --skip-recon was set")
         else:
+            if self.args.srm_row_fraction < 1.0:
+                print(
+                    "Warning: SRM-row sampled output is a cheap-fidelity proxy and "
+                    "should not be used as final reconstruction unless intentionally requested."
+                )
             projs = self.stage_projection(flist)
             recon_npz = self.stage_mlem(flist, projs)
             self.stage_view_npz(recon_npz)
@@ -759,8 +787,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dry-run", action="store_true", help="Print commands and output layout without executing stages.")
 
     parser.add_argument("--aperture-diam", type=float, default=None)
+    parser.add_argument(
+        "--layout-file",
+        type=Path,
+        default=None,
+        help="Use an existing scanner layout tensor instead of generating geometry.",
+    )
     parser.add_argument("--detector-radial-shift-mm", type=float, default=0.0)
     parser.add_argument("--n-apertures", type=int, default=None)
+    parser.add_argument("--n-crystals-ring1", "--n_crystals_ring1", dest="n_crystals_ring1", type=int, default=480)
+    parser.add_argument("--n-crystals-ring2", "--n_crystals_ring2", dest="n_crystals_ring2", type=int, default=720)
     parser.add_argument("--scint-radial-mm", type=float, default=None)
     parser.add_argument("--ring-thickness", type=float, default=None)
 
@@ -777,6 +813,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pose-workers", type=int, default=None)
     parser.add_argument("--torch-threads", type=int, default=None)
     parser.add_argument("--torch-interop-threads", type=int, default=None)
+    parser.add_argument("--srm-row-fraction", type=float, default=1.0)
+    parser.add_argument("--srm-row-mode", type=str, default="ring_cell_random")
+    parser.add_argument("--srm-row-seed", type=int, default=42)
 
     parser.add_argument("--n-bins", type=int, default=None)
     parser.add_argument("--fwhm-min", type=float, default=None)

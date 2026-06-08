@@ -35,6 +35,7 @@ from matplotlib.animation import FuncAnimation
 from matplotlib.collections import PolyCollection
 from matplotlib.ticker import PercentFormatter
 from scanner_modeling._geometry_2d._io import load_scanner_geometry_from_layout, load_scanner_layouts
+from srm_row_sampling import read_row_sampling_metadata
 
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -62,6 +63,56 @@ def _polycollection_from_vertices(vertices: torch.Tensor, **kwargs):
 
 def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
+
+
+def _scaled_ppdf_pixel_sum(ppdf_path: str):
+    with h5py.File(ppdf_path, "r") as f:
+        ppdfs = f["ppdfs"][:].astype(np.float64, copy=False)
+        row_sampling_info = read_row_sampling_metadata(
+            f, ppdf_shape_first_dim=ppdfs.shape[0]
+        )
+
+    sampled = bool(row_sampling_info.get("srm_row_sampled", False))
+    sampled_rows = int(row_sampling_info.get("srm_sampled_rows", ppdfs.shape[0]))
+    total_rows = int(row_sampling_info.get("srm_total_rows", ppdfs.shape[0]))
+    active_rows = int(row_sampling_info.get("srm_active_rows", total_rows))
+    if sampled:
+        if sampled_rows <= 0:
+            raise ValueError(f"Invalid sampled row count in {ppdf_path}: {sampled_rows}")
+        scale = float(active_rows) / float(sampled_rows)
+    else:
+        scale = 1.0
+
+    return np.sum(ppdfs, axis=0) * scale, row_sampling_info
+
+
+def _sampled_proxy_title_suffix(row_sampling_infos: Sequence[dict]) -> str:
+    sampled_infos = [
+        info for info in row_sampling_infos
+        if bool(info.get("srm_row_sampled", False))
+    ]
+    if not sampled_infos:
+        return ""
+
+    fractions = []
+    active_reduced = False
+    for info in sampled_infos:
+        sampled_rows = int(info.get("srm_sampled_rows", 0))
+        total_rows = int(info.get("srm_total_rows", 0))
+        active_rows = int(info.get("srm_active_rows", total_rows))
+        active_reduced = active_reduced or (total_rows > 0 and active_rows < total_rows)
+        fraction = float(
+            info.get(
+                "srm_sampled_fraction_actual",
+                sampled_rows / active_rows if active_rows else info.get("srm_row_fraction", 0.0),
+            )
+        )
+        fractions.append(fraction)
+
+    active_suffix = ", active detector rows" if active_reduced else ""
+    if fractions and all(np.isclose(fraction, 0.5, rtol=0.0, atol=1e-12) for fraction in fractions):
+        return f" | SRM row sampled proxy (50%{active_suffix})"
+    return f" | SRM row sampled proxy{f' ({active_suffix[2:]})' if active_suffix else ''}"
 
 
 def pick_layout_tensor(data_dir: str, explicit: str | None = None) -> str:
@@ -99,22 +150,23 @@ def plot_geometry_overview(layout_file: str, layout_idx: int, plot_dir: str) -> 
 
 
 def compute_ppdf_sensitivity_map(data_dir: str, layout_idxs: Sequence[int], output_name: str = "sensitivity_map_aggregated.png"):
-    all_ppdfs = []
+    all_pixel_sums = []
+    row_sampling_infos = []
     loaded = 0
     for idx in layout_idxs:
         for ppdf_path in sorted(glob.glob(os.path.join(data_dir, f"position_{idx:03d}_ppdfs_t8_*.hdf5"))):
             try:
-                with h5py.File(ppdf_path, "r") as f:
-                    all_ppdfs.append(f["ppdfs"][:].astype(np.float64, copy=False))
+                per_file_pixel_sum, row_sampling_info = _scaled_ppdf_pixel_sum(ppdf_path)
+                all_pixel_sums.append(per_file_pixel_sum)
+                row_sampling_infos.append(row_sampling_info)
                 loaded += 1
             except Exception as exc:
                 print(f"[WARN] failed to read {ppdf_path}: {exc}")
 
-    if not all_ppdfs:
+    if not all_pixel_sums:
         return None
 
-    aggregated = np.sum(np.stack(all_ppdfs, axis=0), axis=0)
-    sensitivity_1d = np.sum(aggregated, axis=0) / max(loaded, 1)
+    sensitivity_1d = np.sum(np.stack(all_pixel_sums, axis=0), axis=0) / max(loaded, 1)
     side = int(np.sqrt(sensitivity_1d.shape[0]))
     if side * side != sensitivity_1d.shape[0]:
         raise RuntimeError(f"PPDF pixel count {sensitivity_1d.shape[0]} is not a square")
@@ -125,7 +177,10 @@ def compute_ppdf_sensitivity_map(data_dir: str, layout_idxs: Sequence[int], outp
     fig, ax = plt.subplots(figsize=(8, 7), layout="constrained")
     im = ax.imshow(image.T, cmap="viridis", origin="lower", extent=extent)
     fig.colorbar(im, ax=ax, label="Average sensitivity")
-    ax.set_title(f"Aggregated sensitivity map ({loaded} PPDF files)")
+    ax.set_title(
+        f"Aggregated sensitivity map ({loaded} PPDF files)"
+        f"{_sampled_proxy_title_suffix(row_sampling_infos)}"
+    )
     ax.set_xlabel("X (mm)")
     ax.set_ylabel("Y (mm)")
 
@@ -137,15 +192,23 @@ def save_sensitivity_visuals(data_dir: str, plot_dir: str, layout_idxs: Sequence
 
     # Per-layout PPDS-like visuals
     for idx in layout_idxs:
-        ppdfs = []
+        pixel_sums = []
+        row_sampling_infos = []
         for ppdf_path in sorted(glob.glob(os.path.join(data_dir, f"position_{idx:03d}_ppdfs_t8_*.hdf5"))):
             with h5py.File(ppdf_path, "r") as f:
-                ppdfs.append(f["ppdfs"][:].astype(np.float64, copy=False))
-        if not ppdfs:
+                ppdfs_shape = f["ppdfs"].shape
+            per_file_pixel_sum, row_sampling_info = _scaled_ppdf_pixel_sum(ppdf_path)
+            pixel_sums.append(per_file_pixel_sum)
+            row_sampling_infos.append(row_sampling_info)
+            if ppdfs_shape[0] != row_sampling_info["srm_sampled_rows"]:
+                raise ValueError(
+                    f"PPDF row count ({ppdfs_shape[0]}) does not match sampled row "
+                    f"metadata ({row_sampling_info['srm_sampled_rows']}) in {ppdf_path}"
+                )
+        if not pixel_sums:
             continue
 
-        aggregated = np.sum(np.stack(ppdfs, axis=0), axis=0)
-        ppds = np.sum(aggregated, axis=0)
+        ppds = np.sum(np.stack(pixel_sums, axis=0), axis=0)
         n_pix = ppds.shape[0]
         side = int(np.sqrt(n_pix))
         if side * side != n_pix:
@@ -165,7 +228,10 @@ def save_sensitivity_visuals(data_dir: str, plot_dir: str, layout_idxs: Sequence
             fig, ax = plt.subplots(figsize=(7, 6), layout="constrained")
             im = ax.imshow(arr.T, cmap="viridis", origin="lower", extent=extent)
             fig.colorbar(im, ax=ax)
-            ax.set_title(f"{title} | layout {idx:03d}")
+            ax.set_title(
+                f"{title} | layout {idx:03d}"
+                f"{_sampled_proxy_title_suffix(row_sampling_infos)}"
+            )
             ax.set_xlabel("X (mm)")
             ax.set_ylabel("Y (mm)")
             out = os.path.join(plot_dir, f"ppds_{suffix}_layout_{idx:03d}.png")
@@ -175,19 +241,20 @@ def save_sensitivity_visuals(data_dir: str, plot_dir: str, layout_idxs: Sequence
 
     # Aggregated across layouts
     agg = None
+    row_sampling_infos = []
     loaded = 0
     for idx in layout_idxs:
         for ppdf_path in sorted(glob.glob(os.path.join(data_dir, f"position_{idx:03d}_ppdfs_t8_*.hdf5"))):
-            with h5py.File(ppdf_path, "r") as f:
-                ppdfs = f["ppdfs"][:].astype(np.float64, copy=False)
+            per_file_pixel_sum, row_sampling_info = _scaled_ppdf_pixel_sum(ppdf_path)
             if agg is None:
-                agg = ppdfs
+                agg = per_file_pixel_sum
             else:
-                agg += ppdfs
+                agg += per_file_pixel_sum
+            row_sampling_infos.append(row_sampling_info)
             loaded += 1
 
     if agg is not None:
-        sens_1d = np.sum(agg, axis=0) / max(loaded, 1)
+        sens_1d = agg / max(loaded, 1)
         side = int(np.sqrt(sens_1d.shape[0]))
         if side * side == sens_1d.shape[0]:
             sens_2d = sens_1d.reshape(side, side)
@@ -195,7 +262,10 @@ def save_sensitivity_visuals(data_dir: str, plot_dir: str, layout_idxs: Sequence
             fig, ax = plt.subplots(figsize=(8, 7), layout="constrained")
             im = ax.imshow(sens_2d.T, cmap="viridis", origin="lower", extent=extent)
             fig.colorbar(im, ax=ax, label="Average sensitivity")
-            ax.set_title(f"Aggregated sensitivity map ({loaded} PPDF files)")
+            ax.set_title(
+                f"Aggregated sensitivity map ({loaded} PPDF files)"
+                f"{_sampled_proxy_title_suffix(row_sampling_infos)}"
+            )
             ax.set_xlabel("X (mm)")
             ax.set_ylabel("Y (mm)")
             out = os.path.join(plot_dir, "sensitivity_map_aggregated.png")
@@ -207,7 +277,10 @@ def save_sensitivity_visuals(data_dir: str, plot_dir: str, layout_idxs: Sequence
             fig, ax = plt.subplots(figsize=(7, 5), layout="constrained")
             ax.hist(flat, bins=100, color="royalblue", alpha=0.8)
             ax.axvline(float(flat.mean()), color="red", ls="--", lw=1.5)
-            ax.set_title("Aggregated sensitivity histogram")
+            ax.set_title(
+                "Aggregated sensitivity histogram"
+                f"{_sampled_proxy_title_suffix(row_sampling_infos)}"
+            )
             ax.set_xlabel("Sensitivity")
             ax.set_ylabel("Pixel count")
             out = os.path.join(plot_dir, "sensitivity_histogram_aggregated.png")

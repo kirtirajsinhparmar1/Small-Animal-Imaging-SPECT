@@ -18,6 +18,22 @@ def get_flist(input_file: str) -> list:
     return flist
 
 
+def validate_matrix_shapes(flist: list, sproj: int, sfov: int) -> None:
+    for fname in flist:
+        with h5py.File(fname, "r") as h5f:
+            if "ppdfs" not in h5f:
+                raise KeyError(f"{fname} does not contain dataset 'ppdfs'")
+            current_shape = tuple(h5f["ppdfs"].shape)
+
+        expected_shape = (sproj, sfov)
+        if current_shape != expected_shape:
+            raise ValueError(
+                f"{fname} ppdfs shape {current_shape} does not match expected "
+                f"{expected_shape}. Projection/MLEM row counts must match the "
+                "current SRM fidelity."
+            )
+
+
 def gaussian_kernel_1d(sigma_px: float, device: torch.device, dtype=torch.float32):
     """
     Create a normalized 1D Gaussian kernel.
@@ -98,7 +114,6 @@ if __name__ == "__main__":
     # --- Geometry / dimensions ---
     IMG_DIM = 200
     SFOV = IMG_DIM * IMG_DIM
-    SPROJ = 3360
 
     # --- MLEM settings ---
     N_ITERATIONS = args.iters
@@ -127,14 +142,19 @@ if __name__ == "__main__":
     if len(flist) == 0:
         raise RuntimeError(f"Empty flist: {flist_path}")
 
-    pdata_full_np = np.load(projs_path)  # expected shape: (len(flist), SPROJ)
+    pdata_full_np = np.load(projs_path)  # expected shape: (len(flist), inferred SPROJ)
+    if pdata_full_np.ndim != 2:
+        raise ValueError(f"Projection array must be 2D, got shape {pdata_full_np.shape}.")
     if pdata_full_np.shape[0] != len(flist):
         raise ValueError(
             f"Projection rows ({pdata_full_np.shape[0]}) != number of system matrices ({len(flist)}). "
             f"Check flist/projection order."
         )
-    if pdata_full_np.shape[1] != SPROJ:
-        raise ValueError(f"Projection width ({pdata_full_np.shape[1]}) != SPROJ ({SPROJ}).")
+    SPROJ = int(pdata_full_np.shape[1])
+    if SPROJ <= 0:
+        raise ValueError(f"Projection width must be positive, got {SPROJ}.")
+    validate_matrix_shapes(flist, SPROJ, SFOV)
+    print(f"Inferred SPROJ from projections/system matrices: {SPROJ}")
 
     pdata_full = torch.from_numpy(pdata_full_np).to(device=device, dtype=torch.float32)
 

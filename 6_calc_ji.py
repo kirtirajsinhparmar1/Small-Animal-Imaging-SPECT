@@ -23,11 +23,28 @@ from typing import Iterable, Sequence
 import h5py
 import numpy as np
 import pandas as pd
+from srm_row_sampling import (
+    read_row_sampling_metadata,
+    assert_compatible_sampled_rows,
+    assert_compatible_active_rows,
+)
 
 DEFAULT_IMG_NX = 200
 DEFAULT_IMG_NY = 200
 DEFAULT_N_BINS = 360
 EPS = 1e-12
+ROW_SAMPLING_METADATA_KEYS = (
+    "srm_row_sampled",
+    "srm_row_fraction",
+    "srm_row_mode",
+    "srm_row_seed",
+    "srm_total_rows",
+    "srm_active_rows",
+    "srm_sampled_rows",
+    "srm_sampled_fraction_actual",
+    "n_crystals_ring1",
+    "n_crystals_ring2",
+)
 
 
 def glob_pattern_list(pattern_text: str | None) -> list[str]:
@@ -56,10 +73,87 @@ def _resolve_col_index(header: Sequence[str], candidates: Iterable[str]) -> int 
     return None
 
 
+def _metadata_equal(key: str, lhs, rhs) -> bool:
+    if lhs is None or rhs is None:
+        return lhs is None and rhs is None
+    if key in {"srm_row_fraction", "srm_sampled_fraction_actual"}:
+        return np.isclose(float(lhs), float(rhs), rtol=0.0, atol=1e-12)
+    return lhs == rhs
+
+
+def _assert_row_sampling_metadata_consistent(reference: dict, current: dict, path: str) -> None:
+    for key in ROW_SAMPLING_METADATA_KEYS:
+        if not _metadata_equal(key, reference.get(key), current.get(key)):
+            raise ValueError(
+                f"Row sampling metadata mismatch in {path}: {key} "
+                f"{current.get(key)!r} != reference {reference.get(key)!r}"
+            )
+
+    assert_compatible_sampled_rows(
+        reference["sampled_detector_unit_indices"],
+        current["sampled_detector_unit_indices"],
+        path,
+    )
+    assert_compatible_active_rows(
+        reference["active_detector_unit_indices"],
+        current["active_detector_unit_indices"],
+        path,
+    )
+
+
+def _row_sampling_csv_fields(row_sampling_info: dict | None) -> dict:
+    if row_sampling_info is None:
+        return {
+            "metric_fidelity": "full",
+            "srm_row_sampled": False,
+            "srm_row_fraction": 1.0,
+            "srm_row_mode": "all",
+            "srm_row_seed": 0,
+            "srm_total_rows": 0,
+            "srm_active_rows": 0,
+            "srm_sampled_rows": 0,
+            "srm_sampled_fraction_actual": np.nan,
+            "n_crystals_ring1": "",
+            "n_crystals_ring2": "",
+        }
+
+    fraction = float(row_sampling_info.get("srm_row_fraction", 1.0))
+    sampled_rows = int(row_sampling_info.get("srm_sampled_rows", 0))
+    total_rows = int(row_sampling_info.get("srm_total_rows", 0))
+    active_rows = int(row_sampling_info.get("srm_active_rows", total_rows))
+    actual_fraction = float(
+        row_sampling_info.get(
+            "srm_sampled_fraction_actual",
+            (sampled_rows / active_rows) if active_rows else fraction,
+        )
+    )
+
+    if np.isclose(fraction, 1.0, rtol=0.0, atol=1e-12):
+        metric_fidelity = "full"
+    elif np.isclose(fraction, 0.5, rtol=0.0, atol=1e-12):
+        metric_fidelity = "srm_row50"
+    else:
+        metric_fidelity = f"srm_row{int(round(fraction * 100)):02d}"
+
+    return {
+        "metric_fidelity": metric_fidelity,
+        "srm_row_sampled": bool(row_sampling_info.get("srm_row_sampled", False)),
+        "srm_row_fraction": fraction,
+        "srm_row_mode": str(row_sampling_info.get("srm_row_mode", "all")),
+        "srm_row_seed": int(row_sampling_info.get("srm_row_seed", 0)),
+        "srm_total_rows": total_rows,
+        "srm_active_rows": active_rows,
+        "srm_sampled_rows": sampled_rows,
+        "srm_sampled_fraction_actual": actual_fraction,
+        "n_crystals_ring1": row_sampling_info.get("n_crystals_ring1", ""),
+        "n_crystals_ring2": row_sampling_info.get("n_crystals_ring2", ""),
+    }
+
+
 def compute_sensitivity(work_dir: str, ppdf_pattern: str | None = None):
     """
     Sum all matching PPDF files and return:
-      (sensitivity_total, sensitivity_mean_per_file, n_files, matching_files)
+      (sensitivity_total, sensitivity_mean_per_file, n_files, matching_files, row_sampling_info)
     """
     if ppdf_pattern:
         ppdf_files = glob_pattern_list(ppdf_pattern)
@@ -76,30 +170,64 @@ def compute_sensitivity(work_dir: str, ppdf_pattern: str | None = None):
             if ppdf_files:
                 break
 
-    aggregated_ppdfs = None
+    aggregated_per_pixel_sum = None
+    reference_row_sampling_info = None
     successful = 0
 
     for ppdf_file in ppdf_files:
         try:
             with h5py.File(ppdf_file, "r") as f:
                 ppdfs = f["ppdfs"][:].astype(np.float64, copy=False)
+                row_sampling_info = read_row_sampling_metadata(
+                    f, ppdf_shape_first_dim=ppdfs.shape[0]
+                )
         except Exception as exc:
             print(f"[WARN] Failed to read PPDF file {ppdf_file}: {exc}")
             continue
 
-        if aggregated_ppdfs is None:
-            aggregated_ppdfs = ppdfs
+        sampled_rows = row_sampling_info["sampled_detector_unit_indices"]
+        sampled_count = int(row_sampling_info.get("srm_sampled_rows", len(sampled_rows)))
+        total_rows = int(row_sampling_info.get("srm_total_rows", ppdfs.shape[0]))
+        active_rows = row_sampling_info["active_detector_unit_indices"]
+        active_count = int(row_sampling_info.get("srm_active_rows", len(active_rows)))
+        if sampled_count != len(sampled_rows):
+            raise ValueError(
+                f"Row sampling metadata mismatch in {ppdf_file}: srm_sampled_rows "
+                f"{sampled_count} != sampled_detector_unit_indices length {len(sampled_rows)}"
+            )
+        if active_count != len(active_rows):
+            raise ValueError(
+                f"Row sampling metadata mismatch in {ppdf_file}: srm_active_rows "
+                f"{active_count} != active_detector_unit_indices length {len(active_rows)}"
+            )
+        if bool(row_sampling_info.get("srm_row_sampled", False)) and sampled_count <= 0:
+            raise ValueError(f"Invalid sampled row count in {ppdf_file}: {sampled_count}")
+
+        if reference_row_sampling_info is None:
+            reference_row_sampling_info = row_sampling_info
         else:
-            aggregated_ppdfs += ppdfs
+            _assert_row_sampling_metadata_consistent(
+                reference_row_sampling_info, row_sampling_info, ppdf_file
+            )
+
+        if bool(row_sampling_info.get("srm_row_sampled", False)):
+            scale = float(active_count) / float(sampled_count)
+        else:
+            scale = 1.0
+
+        per_file_pixel_sum = np.sum(ppdfs, axis=0) * scale
+        if aggregated_per_pixel_sum is None:
+            aggregated_per_pixel_sum = per_file_pixel_sum
+        else:
+            aggregated_per_pixel_sum += per_file_pixel_sum
         successful += 1
 
-    if aggregated_ppdfs is None or successful == 0:
-        return np.nan, np.nan, 0, ppdf_files
+    if aggregated_per_pixel_sum is None or successful == 0:
+        return np.nan, np.nan, 0, ppdf_files, None
 
-    per_pixel_sum = np.sum(aggregated_ppdfs, axis=0)
-    sensitivity_total = float(np.mean(per_pixel_sum))
+    sensitivity_total = float(np.mean(aggregated_per_pixel_sum))
     sensitivity_mean = sensitivity_total / successful
-    return sensitivity_total, sensitivity_mean, successful, ppdf_files
+    return sensitivity_total, sensitivity_mean, successful, ppdf_files, reference_row_sampling_info
 
 
 def compute_fwhm_and_asci(
@@ -198,7 +326,9 @@ def compute_ji(
     """
     Compute the full metric bundle for a single configuration directory.
     """
-    sens_total, sens_mean, n_ppdf_files, _ = compute_sensitivity(work_dir, ppdf_pattern=ppdf_pattern)
+    sens_total, sens_mean, n_ppdf_files, _, row_sampling_info = compute_sensitivity(
+        work_dir, ppdf_pattern=ppdf_pattern
+    )
     fwhm_mean, asci_pct, n_prop_files, n_asci_files = compute_fwhm_and_asci(
         work_dir,
         img_nx=img_nx,
@@ -217,7 +347,7 @@ def compute_ji(
     ):
         ji = (sens_mean / (fwhm_mean ** 2)) * asci_pct / 100.0
 
-    return {
+    results = {
         "fwhm_mean": fwhm_mean,
         "sensitivity_total": sens_total,
         "sensitivity_mean": sens_mean,
@@ -227,6 +357,8 @@ def compute_ji(
         "n_asci_files": n_asci_files,
         "JI": ji,
     }
+    results.update(_row_sampling_csv_fields(row_sampling_info))
+    return results
 
 
 def main() -> None:
@@ -262,6 +394,7 @@ def main() -> None:
             "n_asci_files": 0,
             "JI": 0.0,
         }
+        results.update(_row_sampling_csv_fields(None))
         print(f"[{args.config_name}] FORCE_ZERO: {args.reason}")
     else:
         results = compute_ji(
@@ -281,7 +414,17 @@ def main() -> None:
     out_dir = os.path.dirname(args.out_csv) or "."
     os.makedirs(out_dir, exist_ok=True)
     if os.path.exists(args.out_csv):
-        df_new.to_csv(args.out_csv, mode="a", header=False, index=False)
+        try:
+            df_existing = pd.read_csv(args.out_csv)
+        except pd.errors.EmptyDataError:
+            df_new.to_csv(args.out_csv, index=False)
+        else:
+            if list(df_existing.columns) == list(df_new.columns):
+                df_new.to_csv(args.out_csv, mode="a", header=False, index=False)
+            else:
+                pd.concat([df_existing, df_new], ignore_index=True, sort=False).to_csv(
+                    args.out_csv, index=False
+                )
     else:
         df_new.to_csv(args.out_csv, index=False)
 

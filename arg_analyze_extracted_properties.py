@@ -2,6 +2,7 @@ import argparse
 import os
 
 import h5py
+import numpy as np
 import torch
 
 
@@ -33,7 +34,42 @@ def load_beam_masks(path: str):
         if "beam_mask" not in f:
             raise KeyError(f"Dataset 'beam_mask' not found in {path}")
         masks = torch.from_numpy(f["beam_mask"][:])
-    return masks
+        if "sampled_detector_unit_indices" in f:
+            sampled_detector_unit_indices = f["sampled_detector_unit_indices"][:].astype(
+                np.int64, copy=False
+            )
+        else:
+            sampled_detector_unit_indices = np.arange(masks.shape[0], dtype=np.int64)
+        if "active_detector_unit_indices" in f:
+            active_detector_unit_indices = f["active_detector_unit_indices"][:].astype(
+                np.int64, copy=False
+            )
+        else:
+            active_detector_unit_indices = sampled_detector_unit_indices
+
+        row_sampling_info = {
+            "srm_row_sampled": bool(f.attrs.get("srm_row_sampled", False)),
+            "srm_row_fraction": float(f.attrs.get("srm_row_fraction", 1.0)),
+            "srm_row_mode": str(f.attrs.get("srm_row_mode", "all")),
+            "srm_row_seed": int(f.attrs.get("srm_row_seed", 0)),
+            "srm_total_rows": int(f.attrs.get("srm_total_rows", masks.shape[0])),
+            "srm_active_rows": int(
+                f.attrs.get("srm_active_rows", len(active_detector_unit_indices))
+            ),
+            "srm_sampled_rows": int(f.attrs.get("srm_sampled_rows", masks.shape[0])),
+            "srm_sampled_fraction_actual": float(
+                f.attrs.get(
+                    "srm_sampled_fraction_actual",
+                    len(sampled_detector_unit_indices) / max(len(active_detector_unit_indices), 1),
+                )
+            ),
+            "active_detector_unit_indices": active_detector_unit_indices,
+            "sampled_detector_unit_indices": sampled_detector_unit_indices,
+        }
+        for key in ("n_crystals_ring1", "n_crystals_ring2", "n_apertures", "aperture_diam_mm"):
+            if key in f.attrs:
+                row_sampling_info[key] = f.attrs[key]
+    return masks, sampled_detector_unit_indices, active_detector_unit_indices, row_sampling_info
 
 
 def get_required_col_idx(header, required_name: str, file_path: str) -> int:
@@ -66,6 +102,7 @@ def build_asci_histogram(
     layout_beams_properties: torch.Tensor,
     header,
     beams_masks: torch.Tensor,
+    detector_to_mask_row,
     props_file: str,
     n_bins: int,
     n_pix: int,
@@ -112,6 +149,7 @@ def build_asci_histogram(
     if props_f.shape[0] == 0:
         return asci_histogram, 0
 
+    total_valid_beams_used = 0
     angular_bin_boundaries = torch.arange(
         n_bins + 1,
         dtype=props_f.dtype,
@@ -128,12 +166,14 @@ def build_asci_histogram(
 
         detector_idx = int(beam_props[detector_col].item())
         beam_idx = int(beam_props[beam_col].item())
-        if detector_idx < 0 or detector_idx >= beams_masks.shape[0]:
+        local_mask_row = detector_to_mask_row.get(detector_idx)
+        if local_mask_row is None:
             continue
 
-        asci_histogram[beams_masks[detector_idx] == beam_idx, angle_bin_idx] += 1
+        asci_histogram[beams_masks[local_mask_row] == beam_idx, angle_bin_idx] += 1
+        total_valid_beams_used += 1
 
-    return asci_histogram, int(props_f.shape[0])
+    return asci_histogram, total_valid_beams_used
 
 
 def main():
@@ -189,12 +229,27 @@ def main():
     print(f"  masks: {masks_file}")
 
     layout_beams_properties, header = load_beam_properties(props_file)
-    beams_masks = load_beam_masks(masks_file)
+    (
+        beams_masks,
+        sampled_detector_unit_indices,
+        active_detector_unit_indices,
+        row_sampling_info,
+    ) = load_beam_masks(masks_file)
+    if beams_masks.shape[0] != len(sampled_detector_unit_indices):
+        raise ValueError(
+            f"Beam mask row count ({beams_masks.shape[0]}) does not match sampled "
+            f"detector index count ({len(sampled_detector_unit_indices)})"
+        )
+    detector_to_mask_row = {
+        int(original_detector_id): local_mask_row
+        for local_mask_row, original_detector_id in enumerate(sampled_detector_unit_indices)
+    }
 
     asci_histogram, total_valid_beams_used = build_asci_histogram(
         layout_beams_properties=layout_beams_properties,
         header=header,
         beams_masks=beams_masks,
+        detector_to_mask_row=detector_to_mask_row,
         props_file=props_file,
         n_bins=args.n_bins,
         n_pix=n_pix,
@@ -205,6 +260,16 @@ def main():
     print(f"\nSaving histogram to: {out_path}")
     with h5py.File(out_path, "w") as f:
         f.create_dataset("asci_histogram", data=asci_histogram.numpy())
+        f.create_dataset(
+            "sampled_detector_unit_indices",
+            data=sampled_detector_unit_indices.astype(np.int64, copy=False),
+            dtype="int64",
+        )
+        f.create_dataset(
+            "active_detector_unit_indices",
+            data=active_detector_unit_indices.astype(np.int64, copy=False),
+            dtype="int64",
+        )
         f.attrs["layout_idx"] = int(layout_idx)
         f.attrs["t8_aggregated"] = int(args.t8)
         f.attrs["n_bins"] = int(args.n_bins)
@@ -212,9 +277,24 @@ def main():
         f.attrs["fwhm_max_mm"] = float(args.fwhm_max)
         f.attrs["img_nx"] = int(args.img_nx)
         f.attrs["img_ny"] = int(args.img_ny)
+        f.attrs["srm_row_sampled"] = bool(row_sampling_info["srm_row_sampled"])
+        f.attrs["srm_row_fraction"] = float(row_sampling_info["srm_row_fraction"])
+        f.attrs["srm_row_mode"] = str(row_sampling_info["srm_row_mode"])
+        f.attrs["srm_row_seed"] = int(row_sampling_info["srm_row_seed"])
+        f.attrs["srm_total_rows"] = int(row_sampling_info["srm_total_rows"])
+        f.attrs["srm_active_rows"] = int(row_sampling_info["srm_active_rows"])
+        f.attrs["srm_sampled_rows"] = int(row_sampling_info["srm_sampled_rows"])
+        f.attrs["srm_sampled_fraction_actual"] = float(
+            row_sampling_info["srm_sampled_fraction_actual"]
+        )
+        f.attrs["n_sampled_detector_rows_used"] = int(len(sampled_detector_unit_indices))
+        f.attrs["n_active_detector_rows_used"] = int(len(active_detector_unit_indices))
         f.attrs["total_valid_beams_used"] = int(total_valid_beams_used)
         f.attrs["beam_properties_file"] = os.path.basename(props_file)
         f.attrs["beam_masks_file"] = os.path.basename(masks_file)
+        for key in ("n_crystals_ring1", "n_crystals_ring2", "n_apertures", "aperture_diam_mm"):
+            if key in row_sampling_info:
+                f.attrs[key] = row_sampling_info[key]
 
     print(f"[DONE] total_valid_beams_used = {total_valid_beams_used}")
     print("[DONE] Finished.")

@@ -177,7 +177,7 @@ import os
 import argparse
 import h5py
 from typing import Optional
-from torch import tensor, arange, cat, float32
+from torch import tensor, cat, float32
 
 from beam_property_extract import (
     beams_boundaries_radians,
@@ -196,6 +196,12 @@ from ppdf_io import load_ppdfs_data_from_hdf5
 from beam_property_io import (
     initialize_beam_masks_hdf5,
     append_to_hdf5_dataset,
+)
+from srm_row_sampling import (
+    read_row_sampling_metadata,
+    assert_compatible_sampled_rows,
+    assert_compatible_active_rows,
+    write_row_sampling_metadata,
 )
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -228,6 +234,9 @@ def read_pose_center_from_ppdf_h5(ppdf_path: str):
 def load_aggregated_t8_ppdfs(data_dir: str, layout_idx: int):
     """Load and sum the 8 T8 PPDF pose files for one layout."""
     aggregated = None
+    reference_sampled_rows = None
+    reference_active_rows = None
+    row_sampling_info = None
     loaded = 0
     for pose_idx in range(N_T8_POSES):
         ppdf_filename = f"position_{layout_idx:03d}_ppdfs_t8_{pose_idx:02d}.hdf5"
@@ -236,17 +245,29 @@ def load_aggregated_t8_ppdfs(data_dir: str, layout_idx: int):
             print(f"[WARN] Missing T8 PPDF pose file: {ppdf_path}")
             continue
         with h5py.File(ppdf_path, "r") as f:
-            ppdfs = tensor(f["ppdfs"][:], dtype=float32)
+            ppdfs_data = f["ppdfs"][:]
+            pose_row_sampling_info = read_row_sampling_metadata(
+                f,
+                ppdf_shape_first_dim=ppdfs_data.shape[0],
+            )
+            sampled_rows = pose_row_sampling_info["sampled_detector_unit_indices"]
+            active_rows = pose_row_sampling_info["active_detector_unit_indices"]
+            ppdfs = tensor(ppdfs_data, dtype=float32)
         if aggregated is None:
             aggregated = ppdfs
+            reference_sampled_rows = sampled_rows
+            reference_active_rows = active_rows
+            row_sampling_info = pose_row_sampling_info
         else:
+            assert_compatible_sampled_rows(reference_sampled_rows, sampled_rows, ppdf_path)
+            assert_compatible_active_rows(reference_active_rows, active_rows, ppdf_path)
             aggregated += ppdfs
         loaded += 1
 
     if aggregated is None:
         raise FileNotFoundError(f"No T8 PPDF files found for layout {layout_idx:03d} in {data_dir}")
     print(f"[INFO] Aggregated {loaded}/{N_T8_POSES} T8 PPDF pose files for layout {layout_idx:03d}")
-    return aggregated
+    return aggregated, reference_sampled_rows, row_sampling_info
 
 
 def run_one(
@@ -258,6 +279,8 @@ def run_one(
     layout_file: str,
     fov_center_xy=(0.0, 0.0),
     ppdfs_override=None,
+    sampled_detector_unit_indices=None,
+    row_sampling_info=None,
 ):
     print(f"\n--- Beam mask extraction (T8) ---")
     print(f"[INFO] layout_idx       : {layout_idx}")
@@ -301,8 +324,52 @@ def run_one(
         ppdfs = load_ppdfs_data_from_hdf5(
             ppdfs_dataset_dir, ppdf_filename, fov_dict
         )
+        ppdf_path = os.path.join(ppdfs_dataset_dir, ppdf_filename)
+        with h5py.File(ppdf_path, "r") as f:
+            row_sampling_info = read_row_sampling_metadata(
+                f,
+                ppdf_shape_first_dim=ppdfs.shape[0],
+            )
+        sampled_detector_unit_indices = row_sampling_info["sampled_detector_unit_indices"]
     else:
         ppdfs = ppdfs_override
+        if sampled_detector_unit_indices is None:
+            raise ValueError("sampled_detector_unit_indices is required with ppdfs_override")
+        if row_sampling_info is None:
+            sampled_rows = sampled_detector_unit_indices.astype("int64", copy=False)
+            row_sampling_info = {
+                "srm_row_fraction": 1.0,
+                "srm_row_mode": "all",
+                "srm_row_seed": 0,
+                "srm_total_rows": int(detector_units_vertices.shape[0]),
+                "srm_active_rows": int(len(sampled_rows)),
+                "srm_sampled_rows": int(len(sampled_rows)),
+                "active_detector_unit_indices": sampled_rows,
+                "sampled_detector_unit_indices": sampled_rows,
+            }
+
+    sampled_detector_unit_indices = sampled_detector_unit_indices.astype("int64", copy=False)
+    active_detector_unit_indices = row_sampling_info.get("active_detector_unit_indices")
+    if active_detector_unit_indices is None:
+        active_detector_unit_indices = sampled_detector_unit_indices
+    active_detector_unit_indices = active_detector_unit_indices.astype("int64", copy=False)
+    n_sampled_rows = int(len(sampled_detector_unit_indices))
+    n_active_rows = int(len(active_detector_unit_indices))
+    total_rows = int(row_sampling_info.get("srm_total_rows", int(detector_units_vertices.shape[0])))
+    extra_attrs = {
+        key: row_sampling_info.get(key)
+        for key in ("n_crystals_ring1", "n_crystals_ring2", "n_apertures", "aperture_diam_mm")
+    }
+    write_row_sampling_metadata(
+        out_hdf5_file,
+        sampled_detector_unit_indices,
+        fraction=float(row_sampling_info.get("srm_row_fraction", 1.0)),
+        mode=str(row_sampling_info.get("srm_row_mode", "all")),
+        seed=int(row_sampling_info.get("srm_row_seed", 0)),
+        total_rows=total_rows,
+        active_detector_unit_indices=active_detector_unit_indices,
+        extra_attrs=extra_attrs,
+    )
 
     # Precompute hull points for this FOV.
     detector_unit_centers = detector_units_vertices.mean(dim=1)
@@ -324,11 +391,18 @@ def run_one(
     fov_points_xy = pixels_coordinates(fov_dict)
 
     n_detector_units = int(detector_units_vertices.shape[0])
-    detector_units_sequence = arange(0, n_detector_units)
-    print(f"[INFO] Processing {n_detector_units} detector units...")
+    if ppdfs.shape[0] != n_sampled_rows:
+        raise ValueError(
+            f"PPDF row count {ppdfs.shape[0]} does not match sampled row count {n_sampled_rows}"
+        )
+    print(
+        f"[INFO] Processing {n_sampled_rows}/{n_active_rows} active detector units "
+        f"(total_identity={n_detector_units})..."
+    )
 
-    for detector_unit_idx in detector_units_sequence:
-        ppdf_data_2d = ppdfs[detector_unit_idx].view(
+    for local_row_idx, detector_unit_idx in enumerate(sampled_detector_unit_indices):
+        detector_unit_idx = int(detector_unit_idx)
+        ppdf_data_2d = ppdfs[local_row_idx].view(
             int(fov_dict["n pixels"][0]), int(fov_dict["n pixels"][1])
         )
 
@@ -355,8 +429,8 @@ def run_one(
 
         append_to_hdf5_dataset(beams_masks_dataset, combined_beams_masks)
 
-        if (int(detector_unit_idx) + 1) % 200 == 0:
-            print(f"  ... processed {int(detector_unit_idx) + 1}/{n_detector_units} detector units.")
+        if (local_row_idx + 1) % 200 == 0:
+            print(f"  ... processed {local_row_idx + 1}/{n_sampled_rows} sampled detector units.")
 
     print(f"\n[DONE] Layout {layout_idx} output dataset shape: {list(beams_masks_dataset.shape)}")
     out_hdf5_file.close()
@@ -402,7 +476,10 @@ def main():
     if args.pose is not None:
         raise ValueError("--pose is incompatible with T8 aggregate baseline mode")
 
-    aggregated_ppdfs = load_aggregated_t8_ppdfs(data_dir, layout_idx)
+    aggregated_ppdfs, sampled_detector_unit_indices, row_sampling_info = load_aggregated_t8_ppdfs(
+        data_dir,
+        layout_idx,
+    )
     out_hdf5_filename = f"beams_masks_configuration_{layout_idx:03d}.hdf5"
     run_one(
         layout_idx,
@@ -412,6 +489,8 @@ def main():
         layout_file=layout_file,
         fov_center_xy=(0.0, 0.0),
         ppdfs_override=aggregated_ppdfs,
+        sampled_detector_unit_indices=sampled_detector_unit_indices,
+        row_sampling_info=row_sampling_info,
     )
 
 
